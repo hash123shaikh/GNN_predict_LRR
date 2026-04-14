@@ -97,7 +97,7 @@ conda activate GNNvenv
 pip install numpy==1.24.3 setuptools
 
 # Step 2: PyTorch (must be before torch-geometric)
-pip install torch==2.0.1 torchvision==0.15.2
+pip install torch==2.0.1
 
 # Step 3: PyG extensions (CRITICAL — special URL required)
 pip install torch-scatter torch-sparse torch-cluster \
@@ -127,7 +127,7 @@ pip install tqdm==4.65.0 pyyaml==6.0 joblib==1.3.2
 ```
 numpy, setuptools       ← needed by everything else
       ↓
-torch, torchvision      ← needed by torch-geometric
+torch                   ← needed by torch-geometric
       ↓
 torch-scatter/sparse    ← needed by torch-geometric
       ↓
@@ -145,7 +145,7 @@ If you just want to run the Random Forest baseline right now using your existing
 ```bash
 conda activate GNNvenv
 pip install numpy pandas scikit-learn matplotlib seaborn joblib tqdm
-python main_simple.py --task LR --split_data --train --evaluate
+python3 main_simple.py --task LR --split_data --train --evaluate
 ```
 
 Install the rest later when you are ready for the GNN pipeline.
@@ -169,25 +169,25 @@ After installation, run these checks to confirm everything works:
 
 ```bash
 # Quick individual checks
-python -c "import torch; print(f'PyTorch: {torch.__version__}')"
-python -c "import torch_geometric; print(f'PyG: {torch_geometric.__version__}')"
-python -c "import sklearn; print(f'scikit-learn: {sklearn.__version__}')"
-python -c "import pandas; print(f'pandas: {pandas.__version__}')"
-python -c "import radiomics; print(f'PyRadiomics: {radiomics.__version__}')"
-python -c "import SimpleITK; print(f'SimpleITK: {SimpleITK.__version__}')"
+python3 -c "import torch; print(f'PyTorch: {torch.__version__}')"
+python3 -c "import torch_geometric; print(f'PyG: {torch_geometric.__version__}')"
+python3 -c "import sklearn; print(f'scikit-learn: {sklearn.__version__}')"
+python3 -c "import pandas; print(f'pandas: {pandas.__version__}')"
+python3 -c "import radiomics; print(f'PyRadiomics: {radiomics.__version__}')"
+python3 -c "import SimpleITK; print(f'SimpleITK: {SimpleITK.__version__}')"
 ```
 
 **Full diagnostic** — shows exactly what is and is not installed:
 
 ```bash
-python << EOF
+python3 << EOF
 packages = ['numpy', 'pandas', 'sklearn', 'torch', 'torch_geometric',
             'SimpleITK', 'radiomics', 'matplotlib', 'skimage', 'cv2']
 for pkg in packages:
     try:
         __import__(pkg)
         print(f"  OK  {pkg}")
-    except:
+    except ImportError:
         print(f"  MISSING  {pkg}")
 EOF
 ```
@@ -195,10 +195,10 @@ EOF
 **Test each module individually:**
 
 ```bash
-python data_loader.py           # Tests CT + RT loading
-python preprocessing.py         # Tests CT resampling
-python supervoxel_generator.py  # Tests SLIC supervoxel generation
-python utils.py                 # Tests metrics and plotting
+python3 data_loader.py           # Tests CT + RT loading
+python3 preprocessing.py         # Tests CT resampling
+python3 supervoxel_generator.py  # Tests SLIC supervoxel generation
+python3 utils.py                 # Tests metrics and plotting
 ```
 
 Each should print `...test successful!` at the end.
@@ -209,8 +209,8 @@ Each should print `...test successful!` at the end.
 - [ ] `import torch_geometric` works
 - [ ] `import sklearn` works
 - [ ] `import pandas` works
-- [ ] `python data_loader.py` runs without errors
-- [ ] `python preprocessing.py` runs without errors
+- [ ] `python3 data_loader.py` runs without errors
+- [ ] `python3 preprocessing.py` runs without errors
 
 ---
 
@@ -257,7 +257,7 @@ P002,38.9,145.2,...
 
 ## Configuration
 
-Open `config.py` and update **lines 21–24** with your actual paths:
+Open `config.py` and update the paths with your actual data locations:
 
 ```python
 CT_SCANS_DIR            = DATA_DIR / "ct_scans"
@@ -269,7 +269,6 @@ RADIOMICS_FEATURES_FILE = DATA_DIR / "radiomics_features.csv"
 Verify your **column names** match what is in `config.py`:
 
 ```python
-# Lines 38–47: must match your CSV column names exactly
 CLINICAL_FEATURES = [
     'age', 'sex', 'hpv_status', 'ajcc_stage',
     'ecog_status', 'concurrent_chemo', 'tumor_subsite', 'tumor_volume'
@@ -282,7 +281,6 @@ FOLLOWUP_TIME = 'followup_months'
 Add your GTV contour name if it differs from the defaults:
 
 ```python
-# Line 72
 GTV_NAMES = ['GTV', 'GTVp', 'GTV_Primary', 'GTV_T', 'YOUR_CONTOUR_NAME']
 ```
 
@@ -295,13 +293,13 @@ GTV_NAMES = ['GTV', 'GTVp', 'GTV_Primary', 'GTV_T', 'YOUR_CONTOUR_NAME']
 Uses your existing radiomics CSV directly. Gets you a working AUC immediately.
 
 ```bash
-python main.py --task LR --stage baseline
+python3 main.py --task LR --stage baseline
 ```
 
 Or equivalently:
 
 ```bash
-python main_simple.py --task LR --split_data --train --evaluate
+python3 main_simple.py --task LR --split_data --train --evaluate
 ```
 
 Expected output:
@@ -321,7 +319,7 @@ Specificity: 0.7895
 Resamples CT to 1mm isotropic spacing, defines the 5cm peritumoral region, and runs SLIC to generate ~100 supervoxels per patient.
 
 ```bash
-python main.py --task LR --stage preprocess
+python3 main.py --task LR --stage preprocess
 ```
 
 Output: `outputs/preprocessed/<patient_id>_preprocessed.npz`
@@ -340,7 +338,7 @@ Generated 94 supervoxels
 Extracts ~93 PyRadiomics features from each supervoxel and the whole GTV. Results are cached so you never need to re-run this step.
 
 ```bash
-python main.py --task LR --stage extract
+python3 main.py --task LR --stage extract
 ```
 
 Output: `outputs/features_cache/<patient_id>_features.npz`
@@ -348,7 +346,7 @@ Output: `outputs/features_cache/<patient_id>_features.npz`
 To process a single patient:
 
 ```bash
-python feature_extractor.py --patient_id P001
+python3 feature_extractor.py --patient_id P001
 ```
 
 ---
@@ -358,7 +356,7 @@ python feature_extractor.py --patient_id P001
 Selects the top 20 supervoxels most similar to the GTV and builds a star-topology graph for each patient.
 
 ```bash
-python main.py --task LR --stage graph
+python3 main.py --task LR --stage graph
 ```
 
 Output: `outputs/graphs/<patient_id>_LR.pt`
@@ -366,7 +364,7 @@ Output: `outputs/graphs/<patient_id>_LR.pt`
 To build a single graph:
 
 ```bash
-python graph_builder.py --patient_id P001 --task LR
+python3 graph_builder.py --patient_id P001 --task LR
 ```
 
 ---
@@ -376,13 +374,13 @@ python graph_builder.py --patient_id P001 --task LR
 Trains the Graph Attention Network with early stopping and best model checkpointing.
 
 ```bash
-python main.py --task LR --stage train
+python3 main.py --task LR --stage train
 ```
 
 With K-fold cross-validation (recommended for small datasets):
 
 ```bash
-python main.py --task LR --stage train --use_kfold --n_folds 5
+python3 main.py --task LR --stage train --use_kfold --n_folds 5
 ```
 
 Output: `models/best_model_LR.pth`
@@ -402,7 +400,7 @@ Best val AUC: 0.7734 at epoch 67
 Full evaluation with bootstrap 95% CI, ROC curve, confusion matrix, and attention weight extraction.
 
 ```bash
-python main.py --task LR --stage evaluate --attention --compare
+python3 main.py --task LR --stage evaluate --attention --compare
 ```
 
 ---
@@ -410,15 +408,15 @@ python main.py --task LR --stage evaluate --attention --compare
 ### Run Everything at Once
 
 ```bash
-python main.py --task LR --all
+python3 main.py --task LR --all
 ```
 
 Start from a specific stage if earlier stages are already complete:
 
 ```bash
-python main.py --task LR --from_stage graph      # skip preprocessing
-python main.py --task LR --from_stage train      # skip graph building
-python main.py --task LR --from_stage evaluate --attention --compare
+python3 main.py --task LR --from_stage graph      # skip preprocessing
+python3 main.py --task LR --from_stage train      # skip graph building
+python3 main.py --task LR --from_stage evaluate --attention --compare
 ```
 
 ---
@@ -500,7 +498,7 @@ Parallel path — baseline model (no graphs needed):
 config.py
     └── main_simple.py
             Loads your existing radiomics CSV directly
-            Feature selection using Random Forest importance
+            mRMR feature selection + all-combinations grid search (Appendix S1)
             Trains Random Forest with class balancing
             Outputs AUC, ROC curve, predictions CSV
 ```
@@ -566,7 +564,7 @@ pip install torch-scatter torch-sparse torch-cluster --no-binary :all:
 
 **Fix D — skip and run baseline only:**
 ```bash
-python main_simple.py --task LR --split_data --train --evaluate
+python3 main_simple.py --task LR --split_data --train --evaluate
 ```
 
 ---
@@ -618,7 +616,7 @@ RuntimeError: CUDA not available
 
 **If you have a GPU:**
 ```bash
-pip install torch==2.0.1+cu118 torchvision==0.15.2+cu118 \
+pip install torch==2.0.1+cu118 \
     -f https://download.pytorch.org/whl/torch_stable.html
 pip install torch-scatter torch-sparse \
     -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
@@ -657,7 +655,7 @@ pip install <package> --no-deps
 
 **Fix B — use conda:**
 ```bash
-conda install pytorch torchvision -c pytorch
+conda install pytorch -c pytorch
 conda install scikit-learn pandas matplotlib seaborn -c conda-forge
 ```
 
@@ -677,8 +675,8 @@ bash install_deps.sh
 
 **Fix:**
 ```python
-# In config.py
-BATCH_SIZE = 4   # default is 8
+# In config.py — default batch size is 64 (Table S2)
+BATCH_SIZE = 8   # reduce if you get OOM errors
 ```
 
 ---
@@ -692,7 +690,7 @@ KeyError: 'age'
 
 **Fix:** Print your actual column names and update `config.py`:
 ```bash
-python -c "import pandas as pd; df = pd.read_csv('data/clinical_data.csv'); print(df.columns.tolist())"
+python3 -c "import pandas as pd; df = pd.read_csv('data/clinical_data.csv'); print(df.columns.tolist())"
 ```
 
 ---
@@ -708,6 +706,6 @@ python -c "import pandas as pd; df = pd.read_csv('data/clinical_data.csv'); prin
 | `CUDA not available` | no GPU or wrong version | set `USE_CUDA = False` in config.py |
 | `Metadata generation failed` | dependency missing | install in correct order |
 | `KeyError: 'patient_id'` | wrong column name | check CSV column names in config.py |
-| `FileNotFoundError` | wrong path | update paths in config.py lines 21–24 |
+| `FileNotFoundError` | wrong path | update paths in config.py |
 | `ValueError: incompatible dimensions` | feature count mismatch | check N_FEATURES_TOTAL in config.py |
 | `No GTV contour found` | wrong contour name | add contour name to GTV_NAMES |
