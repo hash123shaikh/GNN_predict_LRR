@@ -22,7 +22,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from pathlib import Path
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 import config
 
@@ -116,23 +116,37 @@ class RadGraphDatasetWithClinical(RadGraphDataset):
         n_clinical          = len(self.feature_cols)
         self.n_clinical     = n_clinical
 
-    def fit_scaler(self):
+    def fit_scaler(self, categorical_cols=None):
         """
-        Fit a StandardScaler on this dataset's clinical features.
-        Call this on the training dataset before creating val/test sets.
+        Fit a MinMaxScaler on QUANTITATIVE clinical features only.
+
+        Per Appendix S1:
+          - Categorical features  → one-hot encoded (assumed pre-done in CSV)
+          - Quantitative features → min-max normalized to [0, 1]
+
+        Parameters
+        ----------
+        categorical_cols : list[str] or None
+            Column names that are already one-hot encoded and should NOT be
+            rescaled. Defaults to config.CLINICAL_CATEGORICAL_FEATURES if
+            defined, otherwise scales all columns.
 
         Returns
         -------
-        scaler : StandardScaler
+        scaler : MinMaxScaler
         """
         all_clinical = np.vstack([
             self.clinical_lookup[pid]
             for pid in self.patient_ids
             if pid in self.clinical_lookup
         ])
-        self.scaler = StandardScaler()
+
+        # Appendix S1: quantitative clinical vars normalized to [0, 1]
+        # Categorical vars (already one-hot) are kept as-is
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
         self.scaler.fit(all_clinical)
-        print(f"Clinical feature scaler fitted on {len(all_clinical)} patients")
+        print(f"Clinical MinMaxScaler fitted on {len(all_clinical)} patients "
+              f"(Appendix S1: quantitative features → [0, 1])")
         return self.scaler
 
     def apply_scaler(self, scaler):
