@@ -28,7 +28,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, BatchNorm
-from torch_geometric.utils import add_self_loops
 
 import config
 
@@ -137,13 +136,13 @@ class RadGraphGAT(nn.Module):
         # Load Table S2 defaults for this task, then allow overrides
         gat_cfg = config.get_gat_config(task)
 
-        self.node_feature_dim    = node_feature_dim    or config.N_FEATURES_TOTAL
-        self.n_clinical_features = n_clinical_features or config.N_CLINICAL_FEATURES
-        self.hidden_dim          = hidden_dim          or gat_cfg['hidden_dim']
-        self.n_heads             = n_heads             or gat_cfg['n_heads']
-        self.n_layers            = n_layers            or gat_cfg['n_layers']
-        self.dropout             = dropout             or gat_cfg['dropout']
-        self.neg_slope           = negative_slope      or config.GAT_NEGATIVE_SLOPE
+        self.node_feature_dim    = config.N_FEATURES_TOTAL        if node_feature_dim    is None else node_feature_dim
+        self.n_clinical_features = config.N_CLINICAL_FEATURES     if n_clinical_features is None else n_clinical_features
+        self.hidden_dim          = gat_cfg['hidden_dim']           if hidden_dim          is None else hidden_dim
+        self.n_heads             = gat_cfg['n_heads']              if n_heads             is None else n_heads
+        self.n_layers            = gat_cfg['n_layers']             if n_layers            is None else n_layers
+        self.dropout             = gat_cfg['dropout']              if dropout             is None else dropout
+        self.neg_slope           = config.GAT_NEGATIVE_SLOPE       if negative_slope      is None else negative_slope
         self.use_clinical        = use_clinical
 
         # ── Input projection ────────────────────────────────────────────────
