@@ -151,29 +151,76 @@ EDGE_WEIGHT_SIGMA = 1.0  # For Gaussian edge weights
 
 # ============================================================================
 # MODEL ARCHITECTURE (GAT)
+# Values from Table S2 — Bae et al. RadGraph paper
 # ============================================================================
 
-# GAT hyperparameters - TUNE THESE ON VALIDATION SET
-GAT_HIDDEN_DIM = 64  # Hidden dimension size
-GAT_N_HEADS = 4  # Number of attention heads
-GAT_N_LAYERS = 2  # Number of GAT layers
-GAT_DROPOUT = 0.3  # Dropout rate
-GAT_NEGATIVE_SLOPE = 0.2  # LeakyReLU negative slope
-GAT_CONCAT_HEADS = True  # Concatenate attention heads (True for hidden layers)
+# Per-task GAT hyperparameters (Table S2)
+# Use get_gat_config(task) to retrieve the correct values at runtime.
+#
+#  Hyperparameter       LR      DM
+#  -------------------  ------  ------
+#  GAT Layers           5       3
+#  Hidden Feature Dim   16      8
+#  Attention Heads      4       4
+#  Dropout              0.67    0.89
+#  Learning Rate        4e-4    3e-4
+#  Weight Decay         7e-4    8e-4
+#  LR Warmup Steps      10      5
+#  Batch Size           64      64
+#  Neighbors (K)        20      20
+#  Sampling Strategy    interm. over
 
-# Final layer configuration
-GAT_FINAL_HEADS = 1  # Typically 1 for final layer (average instead of concat)
+GAT_CONFIG = {
+    'LR': {
+        'n_layers'        : 5,
+        'hidden_dim'      : 16,
+        'n_heads'         : 4,
+        'dropout'         : 0.67,
+        'learning_rate'   : 4e-4,
+        'weight_decay'    : 7e-4,
+        'warmup_steps'    : 10,
+        'batch_size'      : 64,
+        'n_neighbors'     : 20,
+        'sampling_strategy': 'intermediate',  # under/over/intermediate
+    },
+    'DM': {
+        'n_layers'        : 3,
+        'hidden_dim'      : 8,
+        'n_heads'         : 4,
+        'dropout'         : 0.89,
+        'learning_rate'   : 3e-4,
+        'weight_decay'    : 8e-4,
+        'warmup_steps'    : 5,
+        'batch_size'      : 64,
+        'n_neighbors'     : 20,
+        'sampling_strategy': 'over',
+    },
+}
+
+def get_gat_config(task='LR'):
+    """Return Table S2 hyperparameters for a given task."""
+    return GAT_CONFIG.get(task, GAT_CONFIG['LR'])
+
+# Convenience accessors (default to LR values; overridden at runtime via get_gat_config)
+_gat = GAT_CONFIG['LR']
+GAT_N_LAYERS      = _gat['n_layers']       # 5  (LR)
+GAT_HIDDEN_DIM    = _gat['hidden_dim']     # 16 (LR)
+GAT_N_HEADS       = _gat['n_heads']        # 4  (LR)
+GAT_DROPOUT       = _gat['dropout']        # 0.67 (LR)
+GAT_NEGATIVE_SLOPE= 0.2                    # LeakyReLU slope (not tuned in paper)
+GAT_CONCAT_HEADS  = True                   # Concat heads in hidden layers
+GAT_FINAL_HEADS   = 1                      # Average in final layer
 
 # Output dimension after GAT
 GAT_OUTPUT_DIM = GAT_HIDDEN_DIM * GAT_N_HEADS if GAT_CONCAT_HEADS else GAT_HIDDEN_DIM
 
 # Clinical feature integration
 N_CLINICAL_FEATURES = len(CLINICAL_FEATURES)
-COMBINE_METHOD = 'concatenate'  # How to combine GAT output with clinical features
+COMBINE_METHOD      = 'concatenate'
 
 # Final classification layer
-FC_HIDDEN_DIM = 32  # Hidden dimension for final FC layer (optional)
-USE_FC_HIDDEN = False  # Whether to use hidden layer before output
+FC_HIDDEN_DIM = 32
+USE_FC_HIDDEN = False
 
 # ============================================================================
 # TRAINING PARAMETERS
@@ -189,23 +236,28 @@ TEST_RATIO = 0.15  # 15% for testing
 RANDOM_SEED = 42
 
 # Training hyperparameters
-BATCH_SIZE = 8  # Small batch size for small graphs
-LEARNING_RATE = 0.001
-WEIGHT_DECAY = 1e-5
-N_EPOCHS = 100
+# Note: BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY are task-specific (Table S2).
+# The values below are defaults for LR task. Use get_gat_config(task) at runtime.
+BATCH_SIZE            = 64      # Table S2: 64 for both LR and DM
+LEARNING_RATE         = 4e-4    # Table S2: 4e-4 (LR), 3e-4 (DM)
+WEIGHT_DECAY          = 7e-4    # Table S2: 7e-4 (LR), 8e-4 (DM)
+N_EPOCHS              = 100
 EARLY_STOPPING_PATIENCE = 15
 
-# Optimizer
-OPTIMIZER = 'Adam'  # 'Adam', 'SGD', or 'AdamW'
-SCHEDULER = 'ReduceLROnPlateau'  # 'ReduceLROnPlateau', 'StepLR', or None
-SCHEDULER_PATIENCE = 5
-SCHEDULER_FACTOR = 0.5
+# Optimizer — Table S2: Adam for both tasks
+OPTIMIZER         = 'Adam'
+SCHEDULER         = 'WarmupReduceLROnPlateau'  # warmup + ReduceLROnPlateau
+SCHEDULER_PATIENCE= 5
+SCHEDULER_FACTOR  = 0.5
+LR_WARMUP_STEPS   = 10    # Table S2: 10 (LR), 5 (DM)
 
-# Class imbalance handling
-HANDLE_IMBALANCE = True
-IMBALANCE_METHOD = 'weighted_loss'  # 'weighted_loss', 'focal_loss', or 'oversample'
+# Class imbalance — Table S2 sampling strategies
+# LR: 'intermediate' (mix of under + oversampling)
+# DM: 'over'         (oversample minority class)
+HANDLE_IMBALANCE   = True
+IMBALANCE_METHOD   = 'intermediate'  # 'weighted_loss', 'over', 'under', 'intermediate'
 
-# Focal loss parameters (if using focal loss)
+# Focal loss parameters (used when IMBALANCE_METHOD = 'weighted_loss')
 FOCAL_ALPHA = 0.25
 FOCAL_GAMMA = 2.0
 
