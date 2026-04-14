@@ -15,9 +15,10 @@ warnings.filterwarnings('ignore')
 try:
     from rt_utils import RTStructBuilder
     HAS_RT_UTILS = True
-except:
+except ImportError:
     HAS_RT_UTILS = False
     print("Warning: rt-utils not installed. Will try alternative GTV extraction methods.")
+    print("Install with: pip install rt-utils==1.2.7")
 
 import config
 
@@ -123,11 +124,27 @@ class HNSCCDataLoader:
             if rtstruct_file.exists():
                 return rtstruct_file
         
-        # If not found, search in subdirectories
+        # Fallback: search subdirectories
+        # Check filename for common RTSTRUCT prefixes before opening (faster)
         for rtstruct_file in self.rtstruct_dir.rglob(f"*{patient_id}*.dcm"):
-            ds = pydicom.dcmread(rtstruct_file, stop_before_pixels=True)
-            if ds.Modality == 'RTSTRUCT':
-                return rtstruct_file
+            fname_lower = rtstruct_file.name.lower()
+            # Quick filename heuristic — avoids opening every DICOM file
+            if any(hint in fname_lower for hint in ('rs', 'rtstruct', 'struct')):
+                try:
+                    ds = pydicom.dcmread(rtstruct_file, stop_before_pixels=True)
+                    if ds.Modality == 'RTSTRUCT':
+                        return rtstruct_file
+                except Exception:
+                    continue
+
+        # Last resort: open every file matching patient_id
+        for rtstruct_file in self.rtstruct_dir.rglob(f"*{patient_id}*.dcm"):
+            try:
+                ds = pydicom.dcmread(rtstruct_file, stop_before_pixels=True)
+                if ds.Modality == 'RTSTRUCT':
+                    return rtstruct_file
+            except Exception:
+                continue
         
         raise ValueError(f"RT structure file not found for patient {patient_id}")
     
@@ -158,8 +175,17 @@ class HNSCCDataLoader:
         # Try using rt-utils if available
         if HAS_RT_UTILS:
             try:
-                # Get CT directory
+                # Resolve CT directory using the same naming conventions as
+                # load_ct_scan (Bug fix: was hardcoded to str(patient_id) only)
                 patient_ct_dir = self.ct_dir / str(patient_id)
+                if not patient_ct_dir.exists():
+                    patient_ct_dir = self.ct_dir / f"Patient_{patient_id}"
+                if not patient_ct_dir.exists():
+                    patient_ct_dir = self.ct_dir / f"patient_{patient_id}"
+                if not patient_ct_dir.exists():
+                    raise ValueError(
+                        f"CT directory not found for patient {patient_id}"
+                    )
                 
                 # Load RT structure
                 rtstruct = RTStructBuilder.create_from(
@@ -209,41 +235,41 @@ class HNSCCDataLoader:
     
     def _extract_gtv_pydicom(self, rtstruct_file, ct_image):
         """
-        Extract GTV using pydicom (fallback method)
-        This is a simplified implementation - you may need to adapt based on your data
+        Fallback GTV extraction using pydicom only.
+
+        NOTE: Full contour-to-mask rasterisation requires rt-utils.
+        This fallback finds the GTV ROI name but cannot build the binary
+        mask without rt-utils. It raises a clear RuntimeError so the
+        caller knows exactly what is missing rather than silently
+        returning None and causing a cryptic failure downstream.
+
+        Install rt-utils to enable full GTV extraction:
+            pip install rt-utils==1.2.7
         """
         ds = pydicom.dcmread(rtstruct_file)
-        
-        # Find GTV structure
+
+        # Search for GTV ROI name
         gtv_name = None
-        gtv_contour = None
-        
         for roi_seq in ds.StructureSetROISequence:
             roi_name = roi_seq.ROIName
             for name_pattern in config.GTV_NAMES:
                 if name_pattern.lower() in roi_name.lower():
                     gtv_name = roi_name
-                    roi_number = roi_seq.ROINumber
-                    
-                    # Find corresponding contour
-                    for contour_seq in ds.ROIContourSequence:
-                        if contour_seq.ReferencedROINumber == roi_number:
-                            gtv_contour = contour_seq
-                            break
                     break
             if gtv_name:
                 break
-        
+
         if gtv_name is None:
-            print(f"No GTV found in RT structure")
+            print("No GTV found in RT structure.")
+            print(f"Available ROIs: {[r.ROIName for r in ds.StructureSetROISequence]}")
             return None, None
-        
-        # For simplicity, this returns None and recommends using rt-utils
-        print(f"Found GTV: {gtv_name}")
-        print("Note: Complete GTV extraction requires rt-utils package")
-        print("Please install: pip install rt-utils")
-        
-        return None, gtv_name
+
+        # GTV name found but mask cannot be built without rt-utils
+        raise RuntimeError(
+            f"GTV contour '{gtv_name}' found but mask extraction requires rt-utils.\n"
+            f"Install with: pip install rt-utils==1.2.7\n"
+            f"Then re-run the pipeline."
+        )
     
     def get_clinical_features(self, patient_id):
         """
@@ -335,35 +361,50 @@ class HNSCCDataLoader:
         patient_row = patient_row.iloc[0]
         
         if config.FOLLOWUP_TIME in patient_row:
-            return float(patient_row[config.FOLLOWUP_TIME])
+            val = patient_row[config.FOLLOWUP_TIME]
+            # Return 0 for NaN/missing so patient is correctly excluded
+            # by the follow-up filter (Bug fix: was returning 999)
+            return float(val) if pd.notna(val) else 0.0
         else:
-            return 999  # Assume adequate follow-up if not specified
+            return 0.0  # No follow-up data → exclude from analysis
     
     def filter_patients_by_followup(self, min_followup_months=24):
         """
-        Filter patients with adequate follow-up
-        
-        Parameters:
-        -----------
+        Filter patients with adequate follow-up.
+
+        Vectorised — single DataFrame operation instead of per-patient loop.
+
+        Parameters
+        ----------
         min_followup_months : int
-            Minimum follow-up in months
-            
-        Returns:
-        --------
-        valid_patients : list
-            List of patient IDs with adequate follow-up
+
+        Returns
+        -------
+        valid_patients : list[str]
         """
         all_patients = self.get_patient_list()
-        valid_patients = []
-        
-        for patient_id in all_patients:
-            followup = self.get_followup_time(patient_id)
-            if followup >= min_followup_months:
-                valid_patients.append(patient_id)
-        
-        print(f"Patients with >={min_followup_months} months follow-up: {len(valid_patients)}/{len(all_patients)}")
-        
-        return valid_patients
+        n_total      = len(all_patients)
+
+        if config.FOLLOWUP_TIME not in self.clinical_data.columns:
+            # No follow-up column — return all patients with a warning
+            print(f"Warning: '{config.FOLLOWUP_TIME}' column not found. "
+                  f"Returning all {n_total} patients.")
+            return all_patients
+
+        # Vectorised filter — one pass over the DataFrame
+        mask = (
+            self.clinical_data[config.FOLLOWUP_TIME]
+            .fillna(0)                          # Missing → 0 → excluded (Bug 4 fix)
+            >= min_followup_months
+        )
+        valid_ids = self.clinical_data.loc[
+            mask, config.PATIENT_ID_COL
+        ].tolist()
+
+        print(f"Patients with >={min_followup_months} months follow-up: "
+              f"{len(valid_ids)}/{n_total}")
+
+        return valid_ids
     
     def load_patient_data(self, patient_id):
         """
