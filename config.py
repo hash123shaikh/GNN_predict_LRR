@@ -117,19 +117,58 @@ N_FEATURES_TOTAL = 93
 
 # ============================================================================
 # FEATURE SELECTION
+# Table S3 — Bae et al. RadGraph paper
+# Exact radiomic features selected via mRMR for each task
 # ============================================================================
 
 # Number of features to select for each task
-N_FEATURES_LR = 4  # For locoregional recurrence
-N_FEATURES_DM = 6  # For distant metastasis
+N_FEATURES_LR = 4   # Table S3: 4 features for LR
+N_FEATURES_DM = 6   # Table S3: 6 features for DM
 
-# mRMR parameters
-MRMR_METHOD = 'MIQ'  # 'MIQ' or 'MID'
-MRMR_N_CANDIDATES = 20  # Top candidates to consider
+# ── Table S3: Exact selected features (PyRadiomics naming convention) ────────
+#
+# LR features (4):
+#   GLSZM Gray Level Non-Uniformity      → original_glszm_GrayLevelNonUniformity
+#   GLCM Inverse Difference              → original_glcm_Id
+#   GLCM Inverse Difference Normalized   → original_glcm_Idn
+#   GLSZM Zone Entropy                   → original_glszm_ZoneEntropy
+#
+# DM features (6):
+#   NGTDM Coarseness                               → original_ngtdm_Coarseness
+#   First Order Mean Intensity                     → original_firstorder_Mean
+#   GLDM Large Dependence Low Gray Level Emphasis  → original_gldm_LargeDependenceLowGrayLevelEmphasis
+#   GLCM Cluster Prominence                        → original_glcm_ClusterProminence
+#   GLSZM Low Gray Level Zone Emphasis             → original_glszm_LowGrayLevelZoneEmphasis
+#   GLSZM Small Area Emphasis                      → original_glszm_SmallAreaEmphasis
+
+SELECTED_FEATURES = {
+    'LR': [
+        'original_glszm_GrayLevelNonUniformity',
+        'original_glcm_Id',
+        'original_glcm_Idn',
+        'original_glszm_ZoneEntropy',
+    ],
+    'DM': [
+        'original_ngtdm_Coarseness',
+        'original_firstorder_Mean',
+        'original_gldm_LargeDependenceLowGrayLevelEmphasis',
+        'original_glcm_ClusterProminence',
+        'original_glszm_LowGrayLevelZoneEmphasis',
+        'original_glszm_SmallAreaEmphasis',
+    ],
+}
+
+def get_selected_features(task='LR'):
+    """Return Table S3 feature names for a given task."""
+    return SELECTED_FEATURES.get(task, SELECTED_FEATURES['LR'])
+
+# mRMR parameters (used for custom feature selection experiments)
+MRMR_METHOD       = 'MIQ'   # 'MIQ' or 'MID'
+MRMR_N_CANDIDATES = 20
 
 # Random Forest parameters for feature refinement
 RF_N_ESTIMATORS = 100
-RF_MAX_DEPTH = 10
+RF_MAX_DEPTH    = 10
 RF_RANDOM_STATE = 42
 
 # ============================================================================
