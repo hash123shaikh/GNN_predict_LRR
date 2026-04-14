@@ -18,11 +18,9 @@ Usage:
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from torch_geometric.loader import DataLoader
+from torch_geometric.loader import DataLoader as PyGDataLoader
 from sklearn.metrics import roc_auc_score
 from pathlib import Path
-from tqdm import tqdm
 import argparse
 import json
 import time
@@ -31,8 +29,8 @@ warnings.filterwarnings('ignore')
 
 import config
 from model   import RadGraphGAT, get_loss_function
-from dataset import (RadGraphDatasetWithClinical, RadGraphDataset,
-                     split_dataset, kfold_split, get_data_loaders,
+from dataset import (RadGraphDatasetWithClinical,
+                     split_dataset, kfold_split,
                      load_graphs_from_directory, save_split_indices)
 from utils   import (set_seed, get_device, EarlyStopping,
                      save_checkpoint, load_checkpoint, plot_training_history)
@@ -190,12 +188,14 @@ def train_model(
         history['val_loss'].append(val_loss)
         history['val_auc'].append(val_auc)
 
-        # LR scheduling
-        if scheduler is not None:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_auc)
-            else:
-                scheduler.step()
+        # LR scheduling — warmup for first N steps, then ReduceLROnPlateau
+        _apply_schedulers(
+            warmup_scheduler  = scheduler,
+            plateau_scheduler = getattr(config, '_plateau_sch', None),
+            val_auc           = val_auc,
+            current_epoch     = epoch,
+            warmup_steps      = getattr(config, '_warmup_steps', 0)
+        )
 
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -350,7 +350,6 @@ def _build_scheduler(optimizer, task='LR'):
     """
     gat_cfg      = config.get_gat_config(task)
     warmup_steps = gat_cfg['warmup_steps']
-    base_lr      = gat_cfg['learning_rate']
 
     print(f"Scheduler: Linear warmup ({warmup_steps} steps) → ReduceLROnPlateau")
 
@@ -564,13 +563,11 @@ def main():
         if ckpt.exists():
             load_checkpoint(model, optimizer, ckpt)
 
-    # Patch train_model to use dual schedulers via warmup wrapper
-    # We pass warmup_sch as the scheduler; plateau_sch is stepped inside
-    # by monkey-patching the scheduler step call in the loop.
-    # Simpler approach: pass warmup_sch; after warmup_steps epochs switch to plateau.
-    config._warmup_sch  = warmup_sch
-    config._plateau_sch = plateau_sch
-    config._warmup_steps= gat_cfg['warmup_steps']
+    # Store plateau scheduler so train_model's _apply_schedulers can access it.
+    # warmup_sch is passed directly; plateau_sch is retrieved via config._plateau_sch
+    # after warmup_steps epochs.
+    config._plateau_sch  = plateau_sch
+    config._warmup_steps = gat_cfg['warmup_steps']
 
     # Train
     history, best_model_path = train_model(
