@@ -121,7 +121,15 @@ class GraphBuilder:
         sv_feats_sel  = sv_feats[selected_idx]    # (K, F)
         centroids_sel = centroids[selected_idx]   # (K, 3)
 
-        # 2. GTV centroid: mean of all selected supervoxel centroids
+        # ── GTV-relative normalisation (paper exact method) ──────────────────
+        # Paper: "Selected radiomic features for all supervoxels were then
+        # normalized with respect to minimum and maximum GTV radiomic
+        # feature expression."
+        # This means: per patient, use the GTV's own feature values as the
+        # [min, max] reference for normalising supervoxel features.
+        sv_feats_sel, gtv_feats = self._gtv_relative_normalise(
+            sv_feats_sel, gtv_feats
+        )
         gtv_centroid  = centroids_sel.mean(axis=0, keepdims=True)   # (1, 3)
 
         # 3. Build node feature matrix  [GTV | SV_1 | ... | SV_K]
@@ -284,6 +292,51 @@ class GraphBuilder:
             selected_idx = np.argsort(distances)[:K]
 
         return selected_idx
+
+    @staticmethod
+    def _gtv_relative_normalise(sv_feats, gtv_feats):
+        """
+        Normalise supervoxel features relative to the GTV's own min/max values.
+
+        Paper (Methods section):
+          "Selected radiomic features for all supervoxels were then normalized
+           with respect to minimum and maximum GTV radiomic feature expression."
+
+        This is a per-patient normalisation:
+          - For each feature dimension f:
+              sv_norm[:, f] = (sv[:, f] - gtv_min[f]) / (gtv_max[f] - gtv_min[f])
+          - Since GTV is a single vector (not a distribution), its min and max
+            are taken element-wise from the full GTV feature vector range.
+          - Practically: min = 0-clipped GTV value, max = GTV value itself
+            → supervoxels are expressed as multiples of GTV expression.
+
+        Implementation note:
+          We use the GTV feature vector as the reference scale.
+          Each supervoxel feature is divided by the GTV feature value
+          (clamped to avoid division by zero), placing supervoxels in
+          units of "GTV expression."
+
+        Parameters
+        ----------
+        sv_feats  : np.ndarray  (K, F)  — selected supervoxel features
+        gtv_feats : np.ndarray  (F,)    — GTV feature vector
+
+        Returns
+        -------
+        sv_norm   : np.ndarray  (K, F)  — normalised supervoxels
+        gtv_norm  : np.ndarray  (F,)    — GTV as reference (ones where nonzero)
+        """
+        gtv_abs  = np.abs(gtv_feats)
+        scale    = np.where(gtv_abs > 1e-8, gtv_abs, 1.0)
+
+        sv_norm  = sv_feats  / scale[np.newaxis, :]
+        gtv_norm = gtv_feats / scale   # GTV normalises to ±1 per feature
+
+        # Clip to reasonable range to prevent extreme values
+        sv_norm  = np.clip(sv_norm,  -10.0, 10.0)
+        gtv_norm = np.clip(gtv_norm, -10.0, 10.0)
+
+        return sv_norm.astype(np.float32), gtv_norm.astype(np.float32)
 
     @staticmethod
     def _get_feature_indices(all_feature_names, selected_feature_names):
