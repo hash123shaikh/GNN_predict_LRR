@@ -8,9 +8,7 @@ Usage:
 """
 
 import sys
-import os
 from pathlib import Path
-import subprocess
 
 def print_header(text):
     """Print formatted header"""
@@ -25,8 +23,8 @@ def check_python_version():
     version = sys.version_info
     print(f"Python version: {version.major}.{version.minor}.{version.micro}")
     
-    if version.major < 3 or (version.major == 3 and version.minor < 8):
-        print("❌ Python 3.8+ required")
+    if version.major < 3 or (version.major == 3 and version.minor < 9):
+        print("❌ Python 3.9+ required")
         return False
     
     print("✅ Python version OK")
@@ -37,11 +35,14 @@ def check_packages():
     print_header("Checking Required Packages")
     
     required_packages = [
-        ('numpy', 'numpy'),
-        ('pandas', 'pandas'),
-        ('torch', 'torch'),
-        ('sklearn', 'scikit-learn'),
-        ('SimpleITK', 'SimpleITK'),
+        ('numpy',          'numpy'),
+        ('pandas',         'pandas'),
+        ('torch',          'torch'),
+        ('torch_geometric','torch_geometric'),   # critical for GNN pipeline
+        ('sklearn',        'sklearn'),            # was 'scikit-learn' — wrong import name
+        ('SimpleITK',      'SimpleITK'),
+        ('radiomics',      'radiomics'),
+        ('cv2',            'cv2'),
     ]
     
     missing = []
@@ -68,14 +69,8 @@ def check_directory_structure():
     
     base_dir = Path(__file__).parent
     
-    required_dirs = [
-        'data',
-        'outputs',
-        'models',
-        'logs'
-    ]
-    
-    all_exist = True
+    required_dirs = ['data', 'outputs', 'models', 'logs']
+
     for dir_name in required_dirs:
         dir_path = base_dir / dir_name
         if dir_path.exists():
