@@ -4,8 +4,6 @@ Supervoxel generation using SLIC (Simple Linear Iterative Clustering)
 
 import numpy as np
 from skimage.segmentation import slic
-from skimage.measure import regionprops
-import SimpleITK as sitk
 import config
 
 
@@ -54,8 +52,15 @@ class SupervoxelGenerator:
         print(f"  Compactness: {self.compactness}")
         print(f"  Sigma: {self.sigma}")
         
-        # Normalize CT for SLIC (expects [0, 1] or similar range)
-        ct_normalized = (ct_array - ct_array.min()) / (ct_array.max() - ct_array.min() + 1e-6)
+        # Normalise CT within the region mask only so background voxels
+        # (-1000 HU air) don't compress the tumour intensity range
+        ct_in_region = ct_array[region_mask > 0]
+        if ct_in_region.size == 0:
+            raise ValueError("region_mask is empty — no voxels to process")
+        region_min = ct_in_region.min()
+        region_max = ct_in_region.max()
+        ct_normalized = (ct_array - region_min) / (region_max - region_min + 1e-6)
+        ct_normalized = np.clip(ct_normalized, 0.0, 1.0)
         
         # Apply SLIC only in the region of interest
         # Mask out regions outside peritumoral area
@@ -65,22 +70,23 @@ class SupervoxelGenerator:
         try:
             labels = slic(
                 ct_masked,
-                n_segments=self.n_segments,
-                compactness=self.compactness,
-                sigma=self.sigma,
-                multichannel=False,
-                enforce_connectivity=True,
-                max_num_iter=config.SLIC_MAX_ITER,
-                start_label=1  # Start labels from 1 (0 = background)
+                n_segments        = self.n_segments,
+                compactness       = self.compactness,
+                sigma             = self.sigma,
+                channel_axis      = None,            # replaces deprecated multichannel=False
+                enforce_connectivity = True,
+                max_num_iter      = config.SLIC_MAX_ITER,
+                start_label       = 1                # 0 = background
             )
         except Exception as e:
             print(f"Error in SLIC: {e}")
             # Fallback: simpler parameters
             labels = slic(
                 ct_masked,
-                n_segments=self.n_segments,
-                compactness=10,
-                multichannel=False
+                n_segments   = self.n_segments,
+                compactness  = 10,
+                channel_axis = None,                 # replaces deprecated multichannel=False
+                start_label  = 1
             )
         
         # Mask out supervoxels outside region
@@ -89,8 +95,8 @@ class SupervoxelGenerator:
         # Renumber labels to be contiguous (1, 2, 3, ...)
         labels = self._renumber_labels(labels)
         
-        n_supervoxels = labels.max()
-        
+        n_supervoxels = int(labels.max())   # convert numpy scalar to Python int
+
         print(f"  Generated {n_supervoxels} supervoxels")
         
         # Sanity check
