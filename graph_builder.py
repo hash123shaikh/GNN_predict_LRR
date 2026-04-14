@@ -20,12 +20,12 @@ Usage:
 """
 
 import numpy as np
+import pandas as pd
 import torch
 from torch_geometric.data import Data
 from pathlib import Path
 from tqdm import tqdm
 import argparse
-import json
 
 import config
 
@@ -59,9 +59,12 @@ class GraphBuilder:
         edge_weight_method : str
             'inverse_distance', 'gaussian', or 'uniform'.
         """
-        self.K              = n_supervoxels_selected or config.N_SUPERVOXELS_SELECTED
-        self.dist_metric    = distance_metric        or config.DISTANCE_METRIC
-        self.edge_method    = edge_weight_method     or config.EDGE_WEIGHT_METHOD
+        self.K           = config.N_SUPERVOXELS_SELECTED if n_supervoxels_selected is None \
+                           else n_supervoxels_selected
+        self.dist_metric = config.DISTANCE_METRIC        if distance_metric        is None \
+                           else distance_metric
+        self.edge_method = config.EDGE_WEIGHT_METHOD     if edge_weight_method     is None \
+                           else edge_weight_method
 
         print(f"GraphBuilder initialised:")
         print(f"  Supervoxels per graph : {self.K}")
@@ -198,7 +201,7 @@ class GraphBuilder:
             if save_dir:
                 pt_file = save_dir / f'{patient_id}_{task}.pt'
                 if pt_file.exists():
-                    graphs.append(torch.load(pt_file))
+                    graphs.append(torch.load(pt_file, weights_only=False))
                     continue
 
             # Load feature dict
@@ -471,7 +474,7 @@ class GraphBuilder:
                 'centroids'     : data['centroids'],
                 'valid_sv_ids'  : data['valid_sv_ids'],
                 'feature_names' : list(data['feature_names']),
-                'n_supervoxels' : int(data['n_supervoxels']),
+                'n_supervoxels' : int(data['n_supervoxels'][0]),  # stored as 1-D array
             }
         except Exception as e:
             print(f"  ERROR loading {feat_file}: {e}")
@@ -541,7 +544,6 @@ def main():
                         default=str(config.OUTPUT_DIR / 'graphs'))
     args = parser.parse_args()
 
-    import pandas as pd
     clinical_df = pd.read_csv(config.CLINICAL_DATA_FILE)
 
     builder = GraphBuilder()
