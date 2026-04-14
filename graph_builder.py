@@ -70,29 +70,50 @@ class GraphBuilder:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def build_patient_graph(self, patient_id, feature_dict, label):
+    def build_patient_graph(self, patient_id, feature_dict, label, task='LR'):
         """
         Build one PyTorch Geometric Data object for a patient.
+
+        Node features are filtered to the Table S3 selected features for the
+        given task before graph construction.
 
         Parameters
         ----------
         patient_id   : str
         feature_dict : dict  (output of SupervoxelFeatureExtractor)
-            Keys: 'gtv', 'supervoxels', 'centroids', 'n_supervoxels'
+            Keys: 'gtv', 'supervoxels', 'centroids', 'n_supervoxels',
+                  'feature_names'
         label        : int  0 or 1
+        task         : 'LR' or 'DM'
 
         Returns
         -------
-        graph : torch_geometric.data.Data  or None if graph cannot be built
+        graph : torch_geometric.data.Data  or None
         """
         gtv_feats  = feature_dict['gtv']         # (F,)
         sv_feats   = feature_dict['supervoxels']  # (n_sv, F)
         centroids  = feature_dict['centroids']    # (n_sv, 3)
         n_sv       = feature_dict['n_supervoxels']
+        feat_names = feature_dict.get('feature_names', [])
 
         if n_sv == 0:
             print(f"  WARNING: No supervoxels for {patient_id} — skipping")
             return None
+
+        # ── Filter to Table S3 selected features ─────────────────────────────
+        selected_feat_names = config.get_selected_features(task)
+        feature_indices     = self._get_feature_indices(feat_names, selected_feat_names)
+
+        if len(feature_indices) > 0:
+            gtv_feats = gtv_feats[feature_indices]
+            sv_feats  = sv_feats[:, feature_indices]
+            print(f"  Using {len(feature_indices)}/{len(feat_names)} Table S3 features "
+                  f"for task={task}")
+        else:
+            print(f"  WARNING: Table S3 features not found in extracted features.")
+            print(f"  Expected: {selected_feat_names}")
+            print(f"  Available (first 5): {feat_names[:5]}")
+            print(f"  Using all {len(feat_names)} features instead.")
 
         # 1. Select top-K supervoxels by similarity to GTV
         selected_idx = self._select_supervoxels(gtv_feats, sv_feats)
@@ -263,6 +284,45 @@ class GraphBuilder:
             selected_idx = np.argsort(distances)[:K]
 
         return selected_idx
+
+    @staticmethod
+    def _get_feature_indices(all_feature_names, selected_feature_names):
+        """
+        Find indices of Table S3 selected features in the full feature list.
+
+        Matching is done flexibly — checks both exact match and suffix match
+        since PyRadiomics may prepend 'original_' or other prefixes.
+
+        Parameters
+        ----------
+        all_feature_names      : list[str]  — full extracted feature list
+        selected_feature_names : list[str]  — Table S3 feature names
+
+        Returns
+        -------
+        indices : list[int]  — may be shorter than selected_feature_names
+                               if some features are missing
+        """
+        indices = []
+        for sel_name in selected_feature_names:
+            # Try exact match first
+            if sel_name in all_feature_names:
+                indices.append(all_feature_names.index(sel_name))
+                continue
+
+            # Try suffix match (e.g. 'GrayLevelNonUniformity' in
+            # 'original_glszm_GrayLevelNonUniformity')
+            sel_lower = sel_name.lower()
+            found     = False
+            for i, fname in enumerate(all_feature_names):
+                if sel_lower in fname.lower() or fname.lower() in sel_lower:
+                    indices.append(i)
+                    found = True
+                    break
+            if not found:
+                print(f"  WARNING: Feature not found: {sel_name}")
+
+        return indices
 
     @staticmethod
     def _cosine_similarity(vec, matrix):
