@@ -22,7 +22,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from pathlib import Path
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler
 
 import config
 
@@ -96,7 +96,7 @@ class RadGraphDatasetWithClinical(RadGraphDataset):
     clinical_df  : pd.DataFrame  — must have config.PATIENT_ID_COL column
     feature_cols : list[str] or None  — clinical columns to use.
                    Defaults to config.CLINICAL_FEATURES.
-    scaler       : StandardScaler or None  — if None, no scaling applied
+    scaler       : MinMaxScaler or None  — if None, no scaling applied
     """
 
     def __init__(self, graphs, clinical_df, feature_cols=None, scaler=None):
@@ -105,31 +105,47 @@ class RadGraphDatasetWithClinical(RadGraphDataset):
         self.feature_cols = feature_cols or config.CLINICAL_FEATURES
         self.scaler       = scaler
 
-        # Build patient_id → clinical row lookup
-        self.clinical_lookup = {}
-        for _, row in clinical_df.iterrows():
-            pid = str(row[config.PATIENT_ID_COL])
-            vals = row[self.feature_cols].values.astype(np.float32)
-            self.clinical_lookup[pid] = vals
+        # Build patient_id → clinical feature array lookup
+        # Vectorised approach: set_index + to_dict is 10-100x faster than iterrows
+        available_cols = [c for c in self.feature_cols if c in clinical_df.columns]
+        missing_cols   = [c for c in self.feature_cols if c not in clinical_df.columns]
+        if missing_cols:
+            print(f"WARNING: Clinical columns missing from DataFrame: {missing_cols}")
 
-        # Dimensions
-        n_clinical          = len(self.feature_cols)
-        self.n_clinical     = n_clinical
+        lookup_df = (
+            clinical_df
+            .set_index(config.PATIENT_ID_COL)[available_cols]
+            .astype(np.float32)
+        )
+        self.clinical_lookup = {
+            str(pid): row.values
+            for pid, row in lookup_df.iterrows()
+        }
+        # Fill missing features with 0.0
+        if missing_cols:
+            for pid in self.clinical_lookup:
+                self.clinical_lookup[pid] = np.concatenate([
+                    self.clinical_lookup[pid],
+                    np.zeros(len(missing_cols), dtype=np.float32)
+                ])
 
-    def fit_scaler(self, categorical_cols=None):
+        self.n_clinical = len(self.feature_cols)
+
+    def fit_scaler(self):
         """
-        Fit a MinMaxScaler on QUANTITATIVE clinical features only.
+        Fit a MinMaxScaler on all clinical features.
 
         Per Appendix S1:
-          - Categorical features  → one-hot encoded (assumed pre-done in CSV)
-          - Quantitative features → min-max normalized to [0, 1]
+          - Categorical features  → assumed already one-hot encoded in the CSV
+          - Quantitative features → min-max normalised to [0, 1]
 
-        Parameters
-        ----------
-        categorical_cols : list[str] or None
-            Column names that are already one-hot encoded and should NOT be
-            rescaled. Defaults to config.CLINICAL_CATEGORICAL_FEATURES if
-            defined, otherwise scales all columns.
+        Since the CSV is expected to arrive pre-encoded (one-hot for categorical,
+        raw values for quantitative), the scaler is applied to the full feature
+        matrix. One-hot columns will naturally be bounded to [0, 1] already,
+        so applying MinMaxScaler to them is a no-op in practice.
+
+        Call this only on the TRAINING dataset, then pass the fitted scaler
+        to val/test datasets via apply_scaler().
 
         Returns
         -------
@@ -140,13 +156,10 @@ class RadGraphDatasetWithClinical(RadGraphDataset):
             for pid in self.patient_ids
             if pid in self.clinical_lookup
         ])
-
-        # Appendix S1: quantitative clinical vars normalized to [0, 1]
-        # Categorical vars (already one-hot) are kept as-is
         self.scaler = MinMaxScaler(feature_range=(0, 1))
         self.scaler.fit(all_clinical)
         print(f"Clinical MinMaxScaler fitted on {len(all_clinical)} patients "
-              f"(Appendix S1: quantitative features → [0, 1])")
+              f"— quantitative features normalised to [0, 1] (Appendix S1)")
         return self.scaler
 
     def apply_scaler(self, scaler):
@@ -189,10 +202,10 @@ def split_dataset(graphs, train_ratio=None, val_ratio=None, test_ratio=None,
     -------
     train_graphs, val_graphs, test_graphs : list[Data]
     """
-    train_r = train_ratio or config.TRAIN_RATIO
-    val_r   = val_ratio   or config.VAL_RATIO
-    test_r  = test_ratio  or config.TEST_RATIO
-    seed    = random_seed or config.RANDOM_SEED
+    train_r = config.TRAIN_RATIO if train_ratio is None else train_ratio
+    val_r   = config.VAL_RATIO   if val_ratio   is None else val_ratio
+    test_r  = config.TEST_RATIO  if test_ratio  is None else test_ratio
+    seed    = config.RANDOM_SEED if random_seed  is None else random_seed
 
     labels  = np.array([g.y.item() for g in graphs])
     indices = np.arange(len(graphs))
@@ -239,7 +252,7 @@ def kfold_split(graphs, n_splits=5, random_seed=None):
     train_graphs : list[Data]
     val_graphs   : list[Data]
     """
-    seed   = random_seed or config.RANDOM_SEED
+    seed   = config.RANDOM_SEED if random_seed is None else random_seed
     labels = np.array([g.y.item() for g in graphs])
     skf    = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
@@ -266,29 +279,31 @@ def get_data_loaders(train_dataset, val_dataset, test_dataset,
     -------
     train_loader, val_loader, test_loader
     """
-    bs  = batch_size  or config.BATCH_SIZE
-    nw  = num_workers or config.NUM_WORKERS
+    bs         = batch_size  or config.BATCH_SIZE
+    nw         = num_workers or config.NUM_WORKERS
+    # pin_memory is only valid (and beneficial) when using CUDA
+    pin_memory = config.PIN_MEMORY and (config.DEVICE == 'cuda')
 
     train_loader = DataLoader(
         train_dataset,
         batch_size  = bs,
         shuffle     = True,
         num_workers = nw,
-        pin_memory  = config.PIN_MEMORY
+        pin_memory  = pin_memory
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size  = bs,
         shuffle     = False,
         num_workers = nw,
-        pin_memory  = config.PIN_MEMORY
+        pin_memory  = pin_memory
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size  = bs,
         shuffle     = False,
         num_workers = nw,
-        pin_memory  = config.PIN_MEMORY
+        pin_memory  = pin_memory
     )
 
     return train_loader, val_loader, test_loader
@@ -320,7 +335,8 @@ def load_graphs_from_directory(graph_dir, task='LR', patient_ids=None):
 
     for f in files:
         if f.exists():
-            graphs.append(torch.load(f))
+            # weights_only=False required for PyTorch Geometric Data objects
+            graphs.append(torch.load(f, weights_only=False))
         else:
             print(f"  WARNING: Graph file not found: {f}")
 
@@ -360,7 +376,6 @@ def load_split_indices(save_dir, task='LR'):
 if __name__ == '__main__':
     print("Testing dataset module with synthetic graphs...")
 
-    import config
     torch.manual_seed(42)
 
     # Create 20 synthetic graphs
