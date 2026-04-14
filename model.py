@@ -263,24 +263,46 @@ class RadGraphGAT(nn.Module):
 
     def get_attention_weights(self, batch):
         """
-        Extract attention weights from the first GAT layer for interpretability.
+        Extract attention weights from the FINAL GAT layer.
+
+        Paper (Methods — Graph attention atlas creation):
+          "attention values from the GTV readout node to all other graph
+           nodes were extracted from the final GAT layer of each model."
 
         Returns
         -------
-        attention_weights : Tensor  (E_total, n_heads)  or None
+        alpha       : Tensor  (E_total, n_heads)
+        edge_index  : Tensor  (2, E_total)
         """
         x          = batch.x
         edge_index = batch.edge_index
         edge_attr  = getattr(batch, 'edge_attr', None)
 
+        # Forward through all layers, capture attention at the final one
         x = self.input_proj(x)
 
-        # Get attention from layer 0
-        first_layer = self.gat_layers[0].conv
-        _, (_, alpha) = first_layer(
-            x, edge_index, edge_attr=edge_attr, return_attention_weights=True
-        )
-        return alpha
+        alpha      = None
+        edge_index_ = None
+
+        for layer_idx, gat_layer in enumerate(self.gat_layers):
+            is_final = (layer_idx == len(self.gat_layers) - 1)
+
+            if is_final:
+                # Capture attention weights from the final layer only
+                _, (edge_index_, alpha) = gat_layer.conv(
+                    x, edge_index,
+                    edge_attr             = edge_attr,
+                    return_attention_weights = True
+                )
+                # Complete the final layer forward pass
+                x = gat_layer.conv(x, edge_index, edge_attr=edge_attr)
+                x = gat_layer.bn(x)
+                x = gat_layer.activation(x)
+                x = gat_layer.dropout(x)
+            else:
+                x = gat_layer(x, edge_index, edge_attr)
+
+        return alpha, edge_index_
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
