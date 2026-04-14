@@ -429,7 +429,12 @@ class GraphBuilder:
 
 def normalise_graph_features(graphs_train, graphs_val, graphs_test):
     """
-    Standardise node features using training set statistics.
+    Min-max normalise node features using training set statistics.
+
+    Per Appendix S1:
+      "radiomic features used as input to models were the min-max normalized
+       radiomic features from the gross target volume (GTV) region"
+
     Fit scaler on train graphs, apply to all three splits.
 
     Parameters
@@ -438,22 +443,23 @@ def normalise_graph_features(graphs_train, graphs_val, graphs_test):
 
     Returns
     -------
-    graphs_train, graphs_val, graphs_test : list[Data]  — with normalised x
-    scaler_mean : np.ndarray  (F,)
-    scaler_std  : np.ndarray  (F,)
+    graphs_train, graphs_val, graphs_test : list[Data]  — normalised x
+    scaler_min : np.ndarray  (F,)
+    scaler_max : np.ndarray  (F,)
     """
+    from sklearn.preprocessing import MinMaxScaler
+
     # Collect all node features from training graphs
     all_train_features = np.vstack([g.x.numpy() for g in graphs_train])
 
-    scaler_mean = all_train_features.mean(axis=0)
-    scaler_std  = all_train_features.std(axis=0)
-    scaler_std[scaler_std == 0] = 1.0   # Avoid division by zero
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler.fit(all_train_features)
 
     def apply_normalisation(graphs):
         normalised = []
         for g in graphs:
             g_copy   = g.clone()
-            x_norm   = (g_copy.x.numpy() - scaler_mean) / scaler_std
+            x_norm   = scaler.transform(g_copy.x.numpy())
             g_copy.x = torch.tensor(x_norm, dtype=torch.float)
             normalised.append(g_copy)
         return normalised
@@ -462,11 +468,11 @@ def normalise_graph_features(graphs_train, graphs_val, graphs_test):
     graphs_val   = apply_normalisation(graphs_val)
     graphs_test  = apply_normalisation(graphs_test)
 
-    print(f"Node features normalised using train statistics")
-    print(f"  Feature dim : {scaler_mean.shape[0]}")
-    print(f"  Mean range  : [{scaler_mean.min():.3f}, {scaler_mean.max():.3f}]")
+    print(f"Node features min-max normalised to [0, 1] using train statistics")
+    print(f"  Feature dim : {all_train_features.shape[1]}")
+    print(f"  (Appendix S1: min-max normalization for radiomic features)")
 
-    return graphs_train, graphs_val, graphs_test, scaler_mean, scaler_std
+    return graphs_train, graphs_val, graphs_test, scaler.data_min_, scaler.data_max_
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
