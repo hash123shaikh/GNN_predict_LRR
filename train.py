@@ -265,21 +265,39 @@ def train_kfold(graphs, clinical_df, task='LR', n_splits=5, device=None):
         val_ds   = RadGraphDatasetWithClinical(val_graphs, clinical_df)
         val_ds.apply_scaler(scaler)
 
-        # Data loaders
-        train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True)
-        val_loader   = DataLoader(val_ds,   batch_size=config.BATCH_SIZE, shuffle=False)
-
-        # Model + optimiser
+        # Class weights + sampler
         pos_weight = train_ds.get_class_weights()
-        model      = RadGraphGAT().to(device)
-        optimizer  = _build_optimizer(model)
-        scheduler  = _build_scheduler(optimizer)
-        criterion  = get_loss_function(pos_weight).to(device)
+        sampler, _ = _build_sampler(train_graphs, task=task)
+
+        from torch_geometric.loader import DataLoader as PyGDataLoader
+        gat_cfg = config.get_gat_config(task)
+
+        if sampler is not None:
+            train_loader = PyGDataLoader(
+                train_ds, batch_size=gat_cfg['batch_size'],
+                sampler=sampler, num_workers=0
+            )
+        else:
+            train_loader = PyGDataLoader(
+                train_ds, batch_size=gat_cfg['batch_size'], shuffle=True
+            )
+        val_loader = PyGDataLoader(val_ds, batch_size=gat_cfg['batch_size'], shuffle=False)
+
+        # Model + optimiser (Table S2 per-task values)
+        model     = RadGraphGAT(
+            n_layers  = gat_cfg['n_layers'],
+            hidden_dim= gat_cfg['hidden_dim'],
+            n_heads   = gat_cfg['n_heads'],
+            dropout   = gat_cfg['dropout'],
+        ).to(device)
+        optimizer              = _build_optimizer(model, task=task)
+        warmup_sch, plateau_sch= _build_scheduler(optimizer, task=task)
+        criterion              = get_loss_function(pos_weight).to(device)
 
         # Train
         history, _ = train_model(
             model, train_loader, val_loader,
-            optimizer, scheduler, criterion, device,
+            optimizer, warmup_sch, criterion, device,
             task        = task,
             model_name  = f'fold{fold_idx+1}',
         )
@@ -302,46 +320,133 @@ def train_kfold(graphs, clinical_df, task='LR', n_splits=5, device=None):
     return fold_results
 
 
-# ─── Builder helpers ──────────────────────────────────────────────────────────
+# ─── Builder helpers (Table S2 aware) ────────────────────────────────────────
 
-def _build_optimizer(model):
-    """Build optimiser from config."""
+def _build_optimizer(model, task='LR'):
+    """
+    Build optimiser using Table S2 per-task hyperparameters.
+    Table S2: Adam for both LR and DM tasks.
+    """
+    gat_cfg = config.get_gat_config(task)
+    lr      = gat_cfg['learning_rate']
+    wd      = gat_cfg['weight_decay']
+
+    print(f"Optimizer: Adam  lr={lr}  weight_decay={wd}  (Table S2, task={task})")
+
     if config.OPTIMIZER == 'AdamW':
-        return torch.optim.AdamW(
-            model.parameters(),
-            lr           = config.LEARNING_RATE,
-            weight_decay = config.WEIGHT_DECAY
-        )
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     elif config.OPTIMIZER == 'SGD':
-        return torch.optim.SGD(
-            model.parameters(),
-            lr           = config.LEARNING_RATE,
-            momentum     = 0.9,
-            weight_decay = config.WEIGHT_DECAY
-        )
-    else:   # Adam (default)
-        return torch.optim.Adam(
-            model.parameters(),
-            lr           = config.LEARNING_RATE,
-            weight_decay = config.WEIGHT_DECAY
-        )
+        return torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+    else:
+        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
 
-def _build_scheduler(optimizer):
-    """Build LR scheduler from config."""
-    if config.SCHEDULER == 'ReduceLROnPlateau':
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode     = 'max',
-            patience = config.SCHEDULER_PATIENCE,
-            factor   = config.SCHEDULER_FACTOR,
-            verbose  = False
-        )
-    elif config.SCHEDULER == 'StepLR':
-        return torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=20, gamma=0.5
-        )
-    return None
+def _build_scheduler(optimizer, task='LR'):
+    """
+    Build LR scheduler with linear warmup followed by ReduceLROnPlateau.
+
+    Table S2: LR Warmup Steps = 10 (LR task), 5 (DM task).
+    Slowly increasing the LR during warmup improves training stability.
+    """
+    gat_cfg      = config.get_gat_config(task)
+    warmup_steps = gat_cfg['warmup_steps']
+    base_lr      = gat_cfg['learning_rate']
+
+    print(f"Scheduler: Linear warmup ({warmup_steps} steps) → ReduceLROnPlateau")
+
+    # Linear warmup lambda
+    def warmup_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step + 1) / float(warmup_steps)
+        return 1.0
+
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=warmup_lambda
+    )
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode     = 'max',
+        patience = config.SCHEDULER_PATIENCE,
+        factor   = config.SCHEDULER_FACTOR,
+        verbose  = False
+    )
+
+    return warmup_scheduler, plateau_scheduler
+
+
+def _apply_schedulers(warmup_scheduler, plateau_scheduler,
+                      val_auc, current_epoch, warmup_steps):
+    """
+    Step warmup scheduler each epoch during warmup,
+    then hand off to ReduceLROnPlateau.
+    """
+    if current_epoch <= warmup_steps:
+        warmup_scheduler.step()
+    else:
+        plateau_scheduler.step(val_auc)
+
+
+def _build_sampler(train_graphs, task='LR'):
+    """
+    Build a WeightedRandomSampler implementing Table S2 sampling strategies.
+
+    Table S2 sampling strategies:
+      LR task: 'intermediate' — mixture of under and oversampling
+      DM task: 'over'         — oversample minority class
+
+    Parameters
+    ----------
+    train_graphs : list[Data]
+    task         : 'LR' or 'DM'
+
+    Returns
+    -------
+    sampler      : WeightedRandomSampler or None
+    n_samples    : int  — number of samples per epoch
+    """
+    from torch.utils.data import WeightedRandomSampler
+
+    gat_cfg  = config.get_gat_config(task)
+    strategy = gat_cfg['sampling_strategy']
+
+    labels   = np.array([g.y.item() for g in train_graphs])
+    n_total  = len(labels)
+    n_pos    = labels.sum()
+    n_neg    = n_total - n_pos
+
+    if n_pos == 0 or n_neg == 0:
+        print("WARNING: Single-class dataset — skipping sampler")
+        return None, n_total
+
+    print(f"Sampling strategy: {strategy}  "
+          f"(n_neg={n_neg}, n_pos={n_pos}, task={task})")
+
+    if strategy == 'over':
+        # Oversample minority (positive) class to match majority
+        weight_pos = n_neg / n_pos
+        weight_neg = 1.0
+        n_samples  = 2 * n_neg   # epoch size = 2x majority
+
+    elif strategy == 'under':
+        # Undersample majority (negative) class to match minority
+        weight_pos = 1.0
+        weight_neg = n_pos / n_neg
+        n_samples  = 2 * n_pos   # epoch size = 2x minority
+
+    else:  # 'intermediate' — geometric mean weighting
+        weight_pos = np.sqrt(n_neg / n_pos)
+        weight_neg = np.sqrt(n_pos / n_neg)
+        n_samples  = n_total   # keep same epoch size
+
+    sample_weights = np.where(labels == 1, weight_pos, weight_neg)
+    sample_weights = torch.tensor(sample_weights, dtype=torch.double)
+
+    sampler = WeightedRandomSampler(
+        weights     = sample_weights,
+        num_samples = n_samples,
+        replacement = True
+    )
+    return sampler, n_samples
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
@@ -411,31 +516,66 @@ def main():
     val_ds.apply_scaler(scaler)
     test_ds.apply_scaler(scaler)
 
-    # Data loaders
-    train_loader, val_loader, test_loader = get_data_loaders(
-        train_ds, val_ds, test_ds
-    )
+    # ── Sampling strategy (Table S2) ─────────────────────────────────────────
+    # LR: intermediate sampling  |  DM: oversampling
+    gat_cfg = config.get_gat_config(args.task)
+    sampler, _ = _build_sampler(train_graphs, task=args.task)
 
-    # Class weights
-    pos_weight = train_ds.get_class_weights()
+    from torch_geometric.loader import DataLoader as PyGDataLoader
+    if sampler is not None:
+        train_loader = PyGDataLoader(
+            train_ds,
+            batch_size = gat_cfg['batch_size'],
+            sampler    = sampler,
+            num_workers= config.NUM_WORKERS
+        )
+    else:
+        train_loader = PyGDataLoader(
+            train_ds,
+            batch_size = gat_cfg['batch_size'],
+            shuffle    = True,
+            num_workers= config.NUM_WORKERS
+        )
 
-    # Model components
-    model     = RadGraphGAT().to(device)
-    optimizer = _build_optimizer(model)
-    scheduler = _build_scheduler(optimizer)
-    criterion = get_loss_function(pos_weight).to(device)
+    val_loader  = PyGDataLoader(val_ds,  batch_size=gat_cfg['batch_size'], shuffle=False)
+    test_loader = PyGDataLoader(test_ds, batch_size=gat_cfg['batch_size'], shuffle=False)
+
+    # ── Model (Table S2 hyperparameters) ─────────────────────────────────────
+    print(f"\nTable S2 hyperparameters for task={args.task}:")
+    for k, v in gat_cfg.items():
+        print(f"  {k:25s}: {v}")
+
+    model     = RadGraphGAT(
+        n_layers  = gat_cfg['n_layers'],
+        hidden_dim= gat_cfg['hidden_dim'],
+        n_heads   = gat_cfg['n_heads'],
+        dropout   = gat_cfg['dropout'],
+    ).to(device)
+
+    optimizer              = _build_optimizer(model, task=args.task)
+    warmup_sch, plateau_sch= _build_scheduler(optimizer, task=args.task)
+    criterion              = get_loss_function(
+                                 train_ds.get_class_weights()
+                             ).to(device)
 
     # Resume from checkpoint
-    start_epoch = 0
     if args.resume:
         ckpt = config.MODEL_DIR / f'best_model_{args.task}.pth'
         if ckpt.exists():
-            start_epoch, _ = load_checkpoint(model, optimizer, ckpt)
+            load_checkpoint(model, optimizer, ckpt)
+
+    # Patch train_model to use dual schedulers via warmup wrapper
+    # We pass warmup_sch as the scheduler; plateau_sch is stepped inside
+    # by monkey-patching the scheduler step call in the loop.
+    # Simpler approach: pass warmup_sch; after warmup_steps epochs switch to plateau.
+    config._warmup_sch  = warmup_sch
+    config._plateau_sch = plateau_sch
+    config._warmup_steps= gat_cfg['warmup_steps']
 
     # Train
     history, best_model_path = train_model(
         model, train_loader, val_loader,
-        optimizer, scheduler, criterion, device,
+        optimizer, warmup_sch, criterion, device,
         task = args.task,
     )
 
