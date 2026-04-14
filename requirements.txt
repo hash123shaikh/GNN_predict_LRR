@@ -1,5 +1,5 @@
-# RadGraph Implementation Requirements - FIXED VERSION
-# Install in this order to avoid dependency issues
+# RadGraph Implementation — Python Dependencies
+# Install via install_deps.sh (recommended) or step by step as listed below.
 
 # ============================================================================
 # STEP 1: Core dependencies that other packages need
@@ -11,7 +11,7 @@ setuptools>=65.0
 # STEP 2: PyTorch (must be installed before torch-geometric extensions)
 # ============================================================================
 torch==2.0.1
-torchvision==0.15.2
+# torchvision not listed — never imported by this project. torch installs it as a dep.
 
 # ============================================================================
 # STEP 3: Medical imaging (SimpleITK, pydicom, etc.)
@@ -71,9 +71,9 @@ joblib==1.3.2
 # ----------------------------------------
 # conda activate GNNvenv
 # pip install numpy==1.24.3 setuptools
-# pip install torch==2.0.1 torchvision==0.15.2
+# pip install torch==2.0.1
 # pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.0+cpu.html
-# pip install -r requirements_fixed.txt
+# pip install -r requirements.txt
 #
 # METHOD 2 (One command - if Method 1 fails):
 # -------------------------------------------
