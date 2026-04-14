@@ -19,7 +19,20 @@ fi
 echo "Active environment: ${CONDA_DEFAULT_ENV}"
 echo ""
 
-# Step 1: Core dependencies
+# Check Python version is 3.9+
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PYTHON_MAJOR=$(python3 -c "import sys; print(sys.version_info.major)")
+PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
+
+echo "Python version: ${PYTHON_VERSION}"
+
+if [[ "${PYTHON_MAJOR}" -lt 3 ]] || [[ "${PYTHON_MAJOR}" -eq 3 && "${PYTHON_MINOR}" -lt 9 ]]; then
+    echo "ERROR: Python 3.9+ required, found ${PYTHON_VERSION}"
+    echo "Please create the environment with: conda create -n GNNvenv python=3.9"
+    exit 1
+fi
+echo "✓ Python version OK"
+echo ""
 echo "[Step 1/8] Installing core dependencies (numpy, setuptools)..."
 pip install numpy==1.24.3 setuptools>=65.0 || {
     echo "ERROR: Failed to install core dependencies"
@@ -81,7 +94,7 @@ echo ""
 
 # Step 7: ML and image processing packages
 echo "[Step 7/8] Installing ML and image processing packages..."
-pip install mrmr-selection==0.2.6 scikit-learn==1.3.0 scikit-image==0.21.0 scipy==1.11.1 || {
+pip install mrmr-selection==0.2.6 scikit-learn==1.3.0 scikit-image==0.21.0 scipy==1.11.1 opencv-python==4.8.0 || {
     echo "ERROR: Failed to install ML/image processing packages"
     exit 1
 }
@@ -103,12 +116,13 @@ echo "Installation Complete! Verifying..."
 echo "=========================================="
 echo ""
 
-python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-python -c "import torch_geometric; print(f'PyTorch Geometric version: {torch_geometric.__version__}')"
-python -c "import SimpleITK; print(f'SimpleITK version: {SimpleITK.__version__}')"
-python -c "import radiomics; print(f'PyRadiomics version: {radiomics.__version__}')"
-python -c "import sklearn; print(f'scikit-learn version: {sklearn.__version__}')"
-python -c "import pandas; print(f'pandas version: {pandas.__version__}')"
+python3 -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+python3 -c "import torch_geometric; print(f'PyTorch Geometric version: {torch_geometric.__version__}')"
+python3 -c "import SimpleITK; print(f'SimpleITK version: {SimpleITK.__version__}')"
+python3 -c "import radiomics; print(f'PyRadiomics version: {radiomics.__version__}')"
+python3 -c "import sklearn; print(f'scikit-learn version: {sklearn.__version__}')"
+python3 -c "import pandas; print(f'pandas version: {pandas.__version__}')"
+python3 -c "import cv2; print(f'OpenCV version: {cv2.__version__}')"
 
 echo ""
 echo "=========================================="
@@ -116,7 +130,6 @@ echo "✓ All packages installed successfully!"
 echo "=========================================="
 echo ""
 echo "You can now run:"
-echo "  python setup.py          # Check your setup"
-echo "  python data_loader.py    # Test data loading"
-echo "  python main_simple.py --task LR --split_data --train --evaluate"
+echo "  python3 data_loader.py    # Test CT + RT data loading"
+echo "  python3 main_simple.py --task LR --split_data --train --evaluate"
 echo ""
