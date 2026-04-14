@@ -19,11 +19,7 @@ import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-import seaborn as sns
-from sklearn.metrics import (roc_auc_score, roc_curve, confusion_matrix,
-                             accuracy_score, precision_score, recall_score,
-                             f1_score)
-from sklearn.preprocessing import label_binarize
+from sklearn.metrics import confusion_matrix, f1_score
 from torch_geometric.loader import DataLoader
 from pathlib import Path
 import argparse
@@ -32,7 +28,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import config
-from model   import RadGraphGAT
+from model   import RadGraphGAT, get_loss_function
 from dataset import (RadGraphDatasetWithClinical, load_graphs_from_directory,
                      load_split_indices)
 from utils   import (get_device, set_seed, bootstrap_auc, find_optimal_threshold,
@@ -66,7 +62,6 @@ def full_evaluation(model, test_loader, device, task='LR',
     save_dir = Path(save_dir) if save_dir else config.OUTPUT_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    from model import get_loss_function
     criterion = get_loss_function()
 
     _, auc, y_true, y_prob = evaluate_epoch(model, test_loader, criterion, device)
@@ -107,8 +102,14 @@ def full_evaluation(model, test_loader, device, task='LR',
     # ── Save results ─────────────────────────────────────────────────────────
     metrics_path = save_dir / f'metrics_{task}.json'
     with open(metrics_path, 'w') as f:
-        serialisable = {k: float(v) if isinstance(v, (np.floating, float)) else int(v)
-                        for k, v in metrics.items()}
+        serialisable = {}
+        for k, v in metrics.items():
+            if isinstance(v, (np.floating, float)):
+                serialisable[k] = float(v)
+            elif isinstance(v, (np.integer, int)):
+                serialisable[k] = int(v)
+            else:
+                serialisable[k] = v   # string, bool etc — leave as-is
         json.dump(serialisable, f, indent=2)
     print(f"Metrics saved to {metrics_path}")
 
@@ -268,7 +269,10 @@ def compare_with_baseline(task='LR', save_dir=None):
         y_pred = baseline_df['predicted_label'].values
 
         base_auc_mean, base_ci_low, base_ci_high = bootstrap_auc(y_true, y_prob)
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+        # Safe confusion matrix unpacking — handles single-class prediction edge case
+        cm_raw = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = cm_raw.ravel()
         sens = tp / (tp + fn + 1e-8)
         spec = tn / (tn + fp + 1e-8)
 
@@ -334,8 +338,10 @@ def _plot_attention_distribution(attention_df, task, save_dir):
                               .head(20))
 
     fig, ax = plt.subplots(figsize=(12, 5))
+    max_val = mean_attn.values.max()
+    norm_vals = mean_attn.values / max_val if max_val > 0 else mean_attn.values
     bars = ax.bar(range(len(mean_attn)), mean_attn.values,
-                  color=cm.hot(mean_attn.values / mean_attn.values.max()))
+                  color=cm.hot(norm_vals))
     ax.set_xlabel('Supervoxel Index (ranked by mean attention)', fontsize=11)
     ax.set_ylabel('Mean Attention Weight', fontsize=11)
     ax.set_title(f'Top-20 Supervoxel Attention Weights — {task}', fontsize=13)
@@ -389,20 +395,23 @@ def main():
     # Clinical data
     clinical_df = pd.read_csv(config.CLINICAL_DATA_FILE)
     test_ds     = RadGraphDatasetWithClinical(test_graphs, clinical_df)
-    test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # Load best model
-    best_model_path = config.MODEL_DIR / f'best_model_{args.task}.pth'
+    # Use task-specific batch size from Table S2
+    gat_cfg     = config.get_gat_config(args.task)
+    test_loader = DataLoader(test_ds, batch_size=gat_cfg['batch_size'], shuffle=False)
+
+    # Load best model — use config.get_model_paths() as single source of truth
+    model_paths     = config.get_model_paths(args.task)
+    best_model_path = model_paths['best_model']
+
     if not best_model_path.exists():
         print(f"Model not found: {best_model_path}")
-        print("Train the model first with: python train.py --task {args.task}")
+        print(f"Train the model first with: python train.py --task {args.task}")
         return
 
-    model     = RadGraphGAT().to(device)
-    optimizer = _build_optimizer(model)
+    model     = RadGraphGAT(task=args.task).to(device)
+    optimizer = _build_optimizer(model, task=args.task)
     load_checkpoint(model, optimizer, best_model_path)
-
-    # Full evaluation
     print(f"\nEvaluating on {len(test_graphs)} test patients...")
     metrics, y_true, y_prob = full_evaluation(
         model, test_loader, device,
