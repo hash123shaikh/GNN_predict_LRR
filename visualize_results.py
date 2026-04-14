@@ -25,9 +25,11 @@ Usage:
 """
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import matplotlib.patches as mpatches
-from matplotlib.patches import FancyArrowPatch
+from sklearn.metrics import roc_auc_score
 import argparse
 import json
 from pathlib import Path
@@ -135,7 +137,7 @@ def polar_rose_chart(
         for ds_idx, auc in enumerate(aucs):
             theta = angles[ds_idx] + m_idx * bar_width - (n_models * bar_width / 2)
 
-            bar = ax.bar(
+            ax.bar(
                 theta, auc,
                 width     = bar_width * 0.9,
                 bottom    = 0,
@@ -249,13 +251,10 @@ def plot_figure3(auc_data=None, save_path=None, extra_model=None):
                 )
 
     # Legend
-    legend_models = list(MODEL_COLOURS.keys())
-    if extra_model:
-        legend_models = legend_models  # 'Your Model' already included
+    # 'Your Model' colour is already defined in MODEL_COLOURS
     patches = [
         mpatches.Patch(color=MODEL_COLOURS[m], label=m)
-        for m in legend_models
-        if m in MODEL_COLOURS
+        for m in MODEL_COLOURS
     ]
     # Add dashed red outline entry
     patches.append(
@@ -451,8 +450,6 @@ Modes:
 
         baseline_auc = 0.0
         if baseline_file.exists():
-            import pandas as pd
-            from sklearn.metrics import roc_auc_score
             df           = pd.read_csv(baseline_file)
             baseline_auc = roc_auc_score(
                 df['true_label'], df['predicted_prob']
