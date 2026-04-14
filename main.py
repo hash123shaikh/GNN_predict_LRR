@@ -1,473 +1,1021 @@
 """
-Main Pipeline Orchestrator — RadGraph GAT
-==========================================
-Single entry point that runs the entire pipeline end-to-end.
+Simplified RadGraph Implementation - Baseline Random Forest
+===========================================================
+Implements the RF baseline pipeline exactly as described in Appendix S1:
 
-Pipeline stages:
-  Stage 0: Baseline   — Random Forest on existing CSV features (immediate)
-  Stage 1: Preprocess — CT resampling + supervoxel generation
-  Stage 2: Extract    — PyRadiomics feature extraction per supervoxel
-  Stage 3: Graph      — Build PyTorch Geometric graphs
-  Stage 4: Train      — Train GAT model
-  Stage 5: Evaluate   — Full evaluation + attention maps
-  Stage 6: Compare    — GAT vs Baseline comparison table
+  1. Min-max normalize radiomic features (GTV region)
+  2. Select 20 candidate features using mRMR
+  3. Test EVERY combination of 1-20 features from that subset
+  4. Each combination tested with ALL 3 sampling strategies:
+       - undersampling
+       - oversampling
+       - intermediate (combination of both)
+  5. Select best combination by validation AUC
+  6. Report test set performance
 
-Usage examples:
-    # Run full pipeline (all stages)
-    python main.py --task LR --all
+Two baselines implemented (per Statistical Analysis section):
+  --radiomics_baseline  RF trained on radiomic features only  (traditional radiomics)
+  --clinical_baseline   RF trained on clinical variables only  (paper's clinical baseline)
 
-    # Run baseline model only (uses your existing CSV — works immediately)
-    python main.py --task LR --stage baseline
-
-    # Run from preprocessing onwards
-    python main.py --task LR --from_stage preprocess
-
-    # Run from graph building (skip preprocessing if already done)
-    python main.py --task LR --from_stage graph
-
-    # Just train (graphs already built)
-    python main.py --task LR --stage train
-
-    # Evaluate only (model already trained)
-    python main.py --task LR --stage evaluate --attention --compare
+Usage:
+    python main_simple.py --task LR --split_data --train --evaluate
+    python main_simple.py --task LR --split_data --clinical_baseline --train --evaluate
+    python main_simple.py --task DM --split_data --train --evaluate
 """
 
 import argparse
-import sys
-import time
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
+import joblib
+from pathlib import Path
+from itertools import combinations
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.utils import resample
+import torch
 
 import config
-from utils import set_seed, get_device
+from utils import (set_seed, get_device, calculate_metrics,
+                   print_metrics, plot_roc_curve, plot_confusion_matrix)
+
+# ─── mRMR import ──────────────────────────────────────────────────────────────
+try:
+    from mrmr import mrmr_classif
+    HAS_MRMR = True
+except ImportError:
+    HAS_MRMR = False
+    print("WARNING: mrmr-selection not installed. Falling back to RF importance.")
+    print("Install with: pip install mrmr-selection")
 
 
-# ─── Stage 0: Baseline ────────────────────────────────────────────────────────
+# ─── Data loading ─────────────────────────────────────────────────────────────
 
-def run_baseline(task='LR'):
+def load_data():
     """
-    Train and evaluate a Random Forest baseline using existing radiomics CSV.
-    No CT processing needed — uses config.RADIOMICS_FEATURES_FILE directly.
+    Load and min-max normalize radiomic features.
+
+    Per Appendix S1:
+      "radiomic features used as input to models were the min-max normalized
+       radiomic features from the gross target volume (GTV) region"
     """
-    print_banner("Stage 0: Baseline Random Forest")
+    print("Loading data...")
 
-    try:
-        import subprocess, sys
-        cmd = [
-            sys.executable, 'main_simple.py',
-            '--task', task,
-            '--split_data', '--train', '--evaluate'
-        ]
-        result = subprocess.run(cmd, check=True)
-        print("\n✓ Baseline stage complete")
-    except FileNotFoundError:
-        print("main_simple.py not found — running inline baseline...")
-        _inline_baseline(task)
-
-
-def _inline_baseline(task='LR'):
-    """Inline baseline fallback (same logic as main_simple.py)."""
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import roc_auc_score
-    from utils import compute_class_weights, calculate_metrics, print_metrics
-
-    print("Loading features...")
     radiomics_df = pd.read_csv(config.RADIOMICS_FEATURES_FILE)
     clinical_df  = pd.read_csv(config.CLINICAL_DATA_FILE)
 
-    merged = pd.merge(radiomics_df, clinical_df,
-                      on=config.PATIENT_ID_COL, how='inner')
+    print(f"  Radiomics features : {radiomics_df.shape}")
+    print(f"  Clinical data      : {clinical_df.shape}")
 
-    outcome_col  = config.get_outcome_column(task)
-    exclude_cols = ([config.PATIENT_ID_COL, config.OUTCOME_LR,
-                     config.OUTCOME_DM, config.FOLLOWUP_TIME]
-                    + config.CLINICAL_FEATURES)
-    feature_cols = [c for c in merged.columns if c not in exclude_cols]
+    merged_df = pd.merge(radiomics_df, clinical_df,
+                         on=config.PATIENT_ID_COL, how='inner')
+    print(f"  Merged             : {merged_df.shape}")
 
-    X  = merged[feature_cols].values
-    y  = merged[outcome_col].values
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=config.RANDOM_SEED
+    if config.FOLLOWUP_TIME in merged_df.columns:
+        merged_df = merged_df[
+            merged_df[config.FOLLOWUP_TIME] >= config.MIN_FOLLOWUP_MONTHS
+        ]
+        print(f"  After follow-up filter: {merged_df.shape}")
+
+    return merged_df
+
+
+# ─── Sampling strategies ──────────────────────────────────────────────────────
+
+def apply_sampling(X, y, strategy='intermediate', random_state=42):
+    """
+    Apply class-imbalance sampling strategy.
+
+    Appendix S1 strategies:
+      undersampling  — subset majority class to match minority
+      oversampling   — duplicate minority class to match majority
+      intermediate   — geometric mean: partially balance both classes
+    """
+    n_pos = y.sum()
+    n_neg = len(y) - n_pos
+
+    if strategy == 'undersampling':
+        target_n = int(n_pos)
+        neg_idx  = np.where(y == 0)[0]
+        pos_idx  = np.where(y == 1)[0]
+        neg_down = resample(neg_idx, n_samples=target_n,
+                            replace=False, random_state=random_state)
+        keep     = np.concatenate([neg_down, pos_idx])
+        return X[keep], y[keep]
+
+    elif strategy == 'oversampling':
+        target_n = int(n_neg)
+        neg_idx  = np.where(y == 0)[0]
+        pos_idx  = np.where(y == 1)[0]
+        pos_up   = resample(pos_idx, n_samples=target_n,
+                            replace=True, random_state=random_state)
+        keep     = np.concatenate([neg_idx, pos_up])
+        return X[keep], y[keep]
+
+    else:  # intermediate
+        target_n = int(np.sqrt(n_neg * n_pos))
+        neg_idx  = np.where(y == 0)[0]
+        pos_idx  = np.where(y == 1)[0]
+        neg_r = resample(neg_idx, n_samples=target_n,
+                         replace=(target_n > n_neg), random_state=random_state)
+        pos_r = resample(pos_idx, n_samples=target_n,
+                         replace=(target_n > n_pos), random_state=random_state + 1)
+        keep  = np.concatenate([neg_r, pos_r])
+        return X[keep], y[keep]
+
+
+# ─── mRMR feature selection ───────────────────────────────────────────────────
+
+def mrmr_select_candidates(X_train, y_train, n_candidates=20):
+    """
+    Select top-20 candidate features using mRMR.
+
+    Appendix S1: "20 features were initially selected" using mRMR.
+
+    Returns
+    -------
+    candidate_features : list[str]
+    """
+    if HAS_MRMR:
+        print(f"  Running mRMR to select {n_candidates} candidates...")
+        selected = mrmr_classif(
+            X     = X_train,
+            y     = pd.Series(y_train),
+            K     = n_candidates
+        )
+        print(f"  mRMR candidates: {selected}")
+        return selected
+    else:
+        # Fallback: RF importance ranking
+        print(f"  Falling back to RF importance for {n_candidates} candidates...")
+        rf = RandomForestClassifier(
+            n_estimators=200,
+            random_state=config.RF_RANDOM_STATE,
+            n_jobs=-1
+        )
+        rf.fit(X_train.values, y_train)
+        importances = rf.feature_importances_
+        top_idx     = np.argsort(importances)[::-1][:n_candidates]
+        candidates  = X_train.columns[top_idx].tolist()
+        print(f"  RF importance candidates (first 5): {candidates[:5]}")
+        return candidates
+
+
+# ─── Full Appendix S1 feature + sampling grid search ─────────────────────────
+
+def select_best_features_and_sampling(
+    X_train, y_train, X_val, y_val,
+    candidates, task='LR'
+):
+    """
+    Appendix S1 exact procedure:
+      "every combination of one to 20 features from this subset were used to
+       train RF models... Each combination was also trained using either
+       undersampling, oversampling, or a combination of the two...
+       evaluated on the held-out validation set... top performing model was
+       selected based upon AUC"
+
+    Parameters
+    ----------
+    X_train, y_train : training data (already min-max normalised)
+    X_val,   y_val   : validation data
+    candidates       : list[str]  — 20 mRMR candidates
+    task             : 'LR' or 'DM'
+
+    Returns
+    -------
+    best_features  : list[str]
+    best_sampling  : str
+    best_val_auc   : float
+    """
+    sampling_strategies = ['undersampling', 'oversampling', 'intermediate']
+    best_auc      = 0.0
+    best_features = candidates[:config.get_n_features_for_task(task)]
+    best_sampling = 'intermediate'
+
+    X_tr = X_train[candidates].values
+    X_v  = X_val[candidates].values
+
+    total_combos = sum(
+        len(list(combinations(range(len(candidates)), n)))
+        for n in range(1, len(candidates) + 1)
     )
+    print(f"  Grid search: {len(candidates)} candidates × "
+          f"3 sampling strategies")
+    print(f"  Total combinations to test: "
+          f"{total_combos * 3} (this may take a few minutes)...")
 
-    pos_w = compute_class_weights(y_tr)
-    rf    = RandomForestClassifier(
-        n_estimators = 200,
-        class_weight = {0: 1.0, 1: pos_w},
-        random_state = config.RANDOM_SEED, n_jobs=-1
+    tested = 0
+    for n_feat in range(1, len(candidates) + 1):
+        for feat_combo in combinations(range(len(candidates)), n_feat):
+            feat_cols = [candidates[i] for i in feat_combo]
+            X_tr_sub  = X_train[feat_cols].values
+            X_v_sub   = X_val[feat_cols].values
+
+            for strategy in sampling_strategies:
+                X_s, y_s = apply_sampling(
+                    X_tr_sub, y_train,
+                    strategy     = strategy,
+                    random_state = config.RF_RANDOM_STATE
+                )
+
+                rf = RandomForestClassifier(
+                    n_estimators = config.RF_N_ESTIMATORS,
+                    max_depth    = config.RF_MAX_DEPTH,
+                    random_state = config.RF_RANDOM_STATE,
+                    n_jobs       = -1
+                )
+                rf.fit(X_s, y_s)
+
+                try:
+                    y_prob = rf.predict_proba(X_v_sub)[:, 1]
+                    auc    = roc_auc_score(y_val, y_prob)
+                except Exception:
+                    auc = 0.0
+
+                if auc > best_auc:
+                    best_auc      = auc
+                    best_features = feat_cols
+                    best_sampling = strategy
+
+                tested += 1
+                if tested % 500 == 0:
+                    print(f"    Tested {tested} combinations... best AUC so far: {best_auc:.4f}")
+
+    print(f"\n  Best validation AUC  : {best_auc:.4f}")
+    print(f"  Best features ({len(best_features)}): {best_features}")
+    print(f"  Best sampling        : {best_sampling}")
+
+    return best_features, best_sampling, best_auc
+
+
+# ─── Final model training ─────────────────────────────────────────────────────
+
+def train_final_rf(X_train, y_train, X_val, y_val,
+                   best_features, best_sampling, task='LR'):
+    """
+    Train the final RF model with the best feature + sampling combination.
+    """
+    print(f"\n{'='*60}")
+    print(f"Training Final Baseline RF for {task}")
+    print(f"  Features : {best_features}")
+    print(f"  Sampling : {best_sampling}")
+    print(f"{'='*60}")
+
+    X_tr_sel = X_train[best_features].values
+    X_v_sel  = X_val[best_features].values
+
+    X_s, y_s = apply_sampling(X_tr_sel, y_train, strategy=best_sampling,
+                               random_state=config.RF_RANDOM_STATE)
+
+    rf = RandomForestClassifier(
+        n_estimators = config.RF_N_ESTIMATORS * 2,
+        max_depth    = config.RF_MAX_DEPTH,
+        random_state = config.RF_RANDOM_STATE,
+        n_jobs       = -1
     )
-    rf.fit(X_tr, y_tr)
+    rf.fit(X_s, y_s)
 
-    y_prob = rf.predict_proba(X_te)[:, 1]
+    # Validation metrics
+    y_v_prob = rf.predict_proba(X_v_sel)[:, 1]
+    y_v_pred = (y_v_prob >= 0.5).astype(int)
+    val_m    = calculate_metrics(y_val, y_v_pred, y_v_prob)
+    print_metrics(val_m, "Validation")
+
+    return rf
+
+
+# ─── Clinical-only baseline ───────────────────────────────────────────────────
+
+def train_clinical_baseline(
+    clinical_df, outcome_col, task='LR',
+    ids_train=None, ids_val=None, ids_test=None
+):
+    """
+    Train an RF model SOLELY on clinical variables.
+
+    Paper (Statistical Analysis):
+      "A clinical baseline was also studied, consisting of a random forest
+       machine learning model trained solely on clinical variables. These
+       clinical factors included whether a patient underwent concurrent
+       chemoradiation therapy, in addition to patient human papillomavirus
+       infection status, sex, age, tumor stage (AJCC 7th edition), ECOG
+       performance status, tumor subsite, and tumor volume."
+
+    Appendix S1:
+      "The clinical baseline model was implemented in the same fashion,
+       replacing radiomic features with one-hot encoded clinical features."
+      — Same mRMR + all-combinations + all-sampling grid search applies.
+
+    Parameters
+    ----------
+    clinical_df  : pd.DataFrame
+    outcome_col  : str
+    task         : 'LR' or 'DM'
+    ids_train/val/test : np.ndarray or None  — use pre-saved splits if available
+
+    Returns
+    -------
+    model        : fitted RandomForestClassifier
+    test_metrics : dict
+    """
+    print(f"\n{'='*60}")
+    print(f"Clinical-Only Baseline (RF) — Task: {task}")
+    print(f"Features: {config.CLINICAL_FEATURES}")
+    print(f"{'='*60}")
+
+    # Filter adequate follow-up
+    if config.FOLLOWUP_TIME in clinical_df.columns:
+        clinical_df = clinical_df[
+            clinical_df[config.FOLLOWUP_TIME] >= config.MIN_FOLLOWUP_MONTHS
+        ].copy()
+
+    patient_ids = clinical_df[config.PATIENT_ID_COL].values
+    y           = clinical_df[outcome_col].values
+
+    # Clinical features — quantitative normalised to [0,1], categorical one-hot
+    # Appendix S1: "quantitative categorical variables were normalized so that
+    #               their values remained between 0 and 1"
+    X_clinical = clinical_df[config.CLINICAL_FEATURES].copy()
+
+    print(f"\nClinical feature matrix: {X_clinical.shape}")
+    print(f"Outcome: {(y==0).sum()} negative, {(y==1).sum()} positive")
+
+    # ── Use saved splits or create new ones ───────────────────────────────────
+    if ids_train is not None and ids_val is not None and ids_test is not None:
+        train_mask = clinical_df[config.PATIENT_ID_COL].isin(ids_train)
+        val_mask   = clinical_df[config.PATIENT_ID_COL].isin(ids_val)
+        test_mask  = clinical_df[config.PATIENT_ID_COL].isin(ids_test)
+
+        X_train = X_clinical[train_mask]
+        X_val   = X_clinical[val_mask]
+        X_test  = X_clinical[test_mask]
+        y_train = y[train_mask.values]
+        y_val   = y[val_mask.values]
+        y_test  = y[test_mask.values]
+        ids_test_final = ids_test
+    else:
+        X_tv, X_test, y_tv, y_test, ids_tv, ids_test_final = train_test_split(
+            X_clinical, y, patient_ids,
+            test_size=config.TEST_RATIO,
+            stratify=y, random_state=config.RANDOM_SEED
+        )
+        val_adj = config.VAL_RATIO / (config.TRAIN_RATIO + config.VAL_RATIO)
+        X_train, X_val, y_train, y_val, _, _ = train_test_split(
+            X_tv, y_tv, ids_tv,
+            test_size=val_adj,
+            stratify=y_tv, random_state=config.RANDOM_SEED
+        )
+
+    # Min-max normalise quantitative clinical features to [0, 1]
+    scaler  = MinMaxScaler(feature_range=(0, 1))
+    X_train_n = pd.DataFrame(scaler.fit_transform(X_train),
+                              columns=config.CLINICAL_FEATURES)
+    X_val_n   = pd.DataFrame(scaler.transform(X_val),
+                              columns=config.CLINICAL_FEATURES)
+    X_test_n  = pd.DataFrame(scaler.transform(X_test),
+                              columns=config.CLINICAL_FEATURES)
+
+    print(f"\nTrain: {len(X_train_n)}  Val: {len(X_val_n)}  Test: {len(X_test_n)}")
+
+    # ── Grid search: all combinations of clinical features × 3 samplings ─────
+    # Appendix S1: same pipeline as radiomics baseline
+    n_feats    = len(config.CLINICAL_FEATURES)
+    strategies = ['undersampling', 'oversampling', 'intermediate']
+    best_auc   = 0.0
+    best_feats = config.CLINICAL_FEATURES
+    best_strat = 'intermediate'
+
+    print(f"\nGrid search: all combinations of {n_feats} clinical features "
+          f"× {len(strategies)} sampling strategies...")
+
+    for n_f in range(1, n_feats + 1):
+        for feat_combo in combinations(range(n_feats), n_f):
+            cols     = [config.CLINICAL_FEATURES[i] for i in feat_combo]
+            X_tr_sub = X_train_n[cols].values
+            X_v_sub  = X_val_n[cols].values
+
+            for strategy in strategies:
+                X_s, y_s = apply_sampling(
+                    X_tr_sub, y_train,
+                    strategy     = strategy,
+                    random_state = config.RF_RANDOM_STATE
+                )
+                rf = RandomForestClassifier(
+                    n_estimators = config.RF_N_ESTIMATORS,
+                    max_depth    = config.RF_MAX_DEPTH,
+                    random_state = config.RF_RANDOM_STATE,
+                    n_jobs       = -1
+                )
+                rf.fit(X_s, y_s)
+                try:
+                    auc = roc_auc_score(y_val, rf.predict_proba(X_v_sub)[:, 1])
+                except Exception:
+                    auc = 0.0
+
+                if auc > best_auc:
+                    best_auc   = auc
+                    best_feats = cols
+                    best_strat = strategy
+
+    print(f"\nBest validation AUC  : {best_auc:.4f}")
+    print(f"Best features ({len(best_feats)}): {best_feats}")
+    print(f"Best sampling        : {best_strat}")
+
+    # ── Train final model ─────────────────────────────────────────────────────
+    X_tr_sel = X_train_n[best_feats].values
+    X_te_sel = X_test_n[best_feats].values
+
+    X_s, y_s = apply_sampling(X_tr_sel, y_train, strategy=best_strat,
+                               random_state=config.RF_RANDOM_STATE)
+    final_rf = RandomForestClassifier(
+        n_estimators = config.RF_N_ESTIMATORS * 2,
+        max_depth    = config.RF_MAX_DEPTH,
+        random_state = config.RF_RANDOM_STATE,
+        n_jobs       = -1
+    )
+    final_rf.fit(X_s, y_s)
+
+    # ── Test evaluation ───────────────────────────────────────────────────────
+    y_prob = final_rf.predict_proba(X_te_sel)[:, 1]
     y_pred = (y_prob >= 0.5).astype(int)
-    metrics = calculate_metrics(y_te, y_pred, y_prob)
-    print_metrics(metrics, prefix=f"Baseline Test ({task})")
+    test_m = calculate_metrics(y_test, y_pred, y_prob, threshold=0.5)
+    print_metrics(test_m, f"Clinical Baseline Test ({task})")
+
+    # Save
+    config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_rf, config.MODEL_DIR / f'clinical_baseline_{task}.pkl')
+    joblib.dump(scaler,   config.MODEL_DIR / f'clinical_scaler_{task}.pkl')
+
+    results_df = pd.DataFrame({
+        'patient_id'     : ids_test_final,
+        'true_label'     : y_test,
+        'predicted_prob' : y_prob,
+        'predicted_label': y_pred,
+        'model'          : 'clinical_baseline'
+    })
+    results_path = config.OUTPUT_DIR / f'clinical_baseline_results_{task}.csv'
+    results_df.to_csv(results_path, index=False)
+    print(f"Clinical baseline results saved to {results_path}")
+
+    plot_roc_curve(y_test, y_prob,
+                   config.OUTPUT_DIR / f'roc_curve_clinical_{task}.png')
+
+    return final_rf, test_m
 
 
-# ─── Stage 1: Preprocess ─────────────────────────────────────────────────────
-
-def run_preprocess(patient_ids):
-    """CT resampling + supervoxel generation for all patients."""
-    print_banner("Stage 1: CT Preprocessing + Supervoxel Generation")
-
-    from data_loader          import HNSCCDataLoader
-    from preprocessing        import CTPreprocessor
-    from supervoxel_generator import SupervoxelGenerator
-    from feature_extractor    import preprocess_and_save_all
-
-    loader       = HNSCCDataLoader(config.CT_SCANS_DIR,
-                                   config.RTSTRUCT_DIR,
-                                   config.CLINICAL_DATA_FILE)
-    preprocessor = CTPreprocessor(target_spacing=config.TARGET_SPACING)
-    sv_gen       = SupervoxelGenerator(
-        n_segments  = config.N_SUPERVOXELS_TARGET,
-        compactness = config.SLIC_COMPACTNESS,
-        sigma       = config.SLIC_SIGMA
-    )
-
-    preprocessed_dir = config.OUTPUT_DIR / 'preprocessed'
-    failed = preprocess_and_save_all(
-        patient_ids, loader, preprocessor, sv_gen, preprocessed_dir
-    )
-
-    print(f"\n✓ Preprocessing complete — "
-          f"{len(patient_ids) - len(failed)}/{len(patient_ids)} succeeded")
-    return failed
-
-
-# ─── Stage 2: Feature Extraction ─────────────────────────────────────────────
-
-def run_feature_extraction(patient_ids, skip_existing=True):
-    """Extract PyRadiomics features from supervoxels."""
-    print_banner("Stage 2: Radiomic Feature Extraction")
-
-    try:
-        from feature_extractor import SupervoxelFeatureExtractor
-    except ImportError as e:
-        print(f"Feature extraction unavailable: {e}")
-        return
-
-    preprocessed_dir = config.OUTPUT_DIR / 'preprocessed'
-    extractor        = SupervoxelFeatureExtractor()
-
-    results, failed = extractor.extract_all_patients(
-        patient_ids           = patient_ids,
-        preprocessed_data_dir = preprocessed_dir,
-        skip_existing         = skip_existing
-    )
-
-    if results:
-        extractor.save_gtv_features_csv(
-            results,
-            config.OUTPUT_DIR / 'gtv_features_extracted.csv'
-        )
-
-    print(f"\n✓ Feature extraction complete — "
-          f"{len(results)}/{len(patient_ids)} succeeded")
-    return results
-
-
-# ─── Stage 3: Graph Building ──────────────────────────────────────────────────
-
-def run_graph_building(task='LR'):
-    """Build patient-level graphs from supervoxel features."""
-    print_banner("Stage 3: Graph Construction")
-
-    from graph_builder import GraphBuilder
-
-    clinical_df      = pd.read_csv(config.CLINICAL_DATA_FILE)
-    feature_cache_dir= config.OUTPUT_DIR / 'features_cache'
-    graph_save_dir   = config.OUTPUT_DIR / 'graphs'
-
-    builder = GraphBuilder()
-    graphs, failed = builder.build_all_graphs(
-        feature_cache_dir = feature_cache_dir,
-        clinical_df       = clinical_df,
-        task              = task,
-        save_dir          = graph_save_dir
-    )
-
-    builder.get_graph_statistics(graphs)
-
-    print(f"\n✓ Graph building complete — "
-          f"{len(graphs)} graphs built, {len(failed)} failed")
-    return graphs
-
-
-# ─── Stage 4: Training ────────────────────────────────────────────────────────
-
-def run_training(task='LR', use_kfold=False, n_folds=5):
-    """Train the GAT model."""
-    print_banner("Stage 4: GAT Model Training")
-
-    import torch
-    from model   import RadGraphGAT, get_loss_function
-    from dataset import (RadGraphDatasetWithClinical, split_dataset,
-                         get_data_loaders, save_split_indices,
-                         load_graphs_from_directory)
-    from train   import (train_model, train_kfold,
-                         _build_optimizer, _build_scheduler)
-    from utils   import plot_training_history
-
-    device      = get_device(config.USE_CUDA)
-    clinical_df = pd.read_csv(config.CLINICAL_DATA_FILE)
-    graph_dir   = config.OUTPUT_DIR / 'graphs'
-    graphs      = load_graphs_from_directory(graph_dir, task=task)
-
-    if len(graphs) == 0:
-        print("No graphs found. Run graph building first.")
-        return
-
-    if use_kfold:
-        fold_results = train_kfold(
-            graphs, clinical_df,
-            task=task, n_splits=n_folds, device=device
-        )
-        import json
-        results_path = config.OUTPUT_DIR / f'kfold_results_{task}.json'
-        with open(results_path, 'w') as f:
-            json.dump(fold_results, f, indent=2)
-        print(f"K-fold results saved to {results_path}")
-        return
-
-    # Single split
-    train_g, val_g, test_g = split_dataset(graphs)
-    save_split_indices(train_g, val_g, test_g,
-                       config.OUTPUT_DIR / 'splits', task)
-
-    train_ds = RadGraphDatasetWithClinical(train_g, clinical_df)
-    scaler   = train_ds.fit_scaler()
-
-    val_ds  = RadGraphDatasetWithClinical(val_g,  clinical_df)
-    test_ds = RadGraphDatasetWithClinical(test_g, clinical_df)
-    val_ds.apply_scaler(scaler)
-    test_ds.apply_scaler(scaler)
-
-    train_loader, val_loader, test_loader = get_data_loaders(
-        train_ds, val_ds, test_ds
-    )
-
-    pos_weight = train_ds.get_class_weights()
-    model      = RadGraphGAT().to(device)
-    optimizer  = _build_optimizer(model)
-    scheduler  = _build_scheduler(optimizer)
-    criterion  = get_loss_function(pos_weight).to(device)
-
-    history, best_path = train_model(
-        model, train_loader, val_loader,
-        optimizer, scheduler, criterion, device,
-        task=task
-    )
-
-    plot_training_history(history,
-                          save_path=config.OUTPUT_DIR / f'training_history_{task}.png')
-
-    print(f"\n✓ Training complete — Best val AUC: {history['best_val_auc']:.4f}")
-    return history
-
-
-# ─── Stage 5: Evaluation ─────────────────────────────────────────────────────
-
-def run_evaluation(task='LR', extract_attention=False):
-    """Full evaluation of the trained model."""
-    print_banner("Stage 5: Model Evaluation")
-
-    import torch
-    from model    import RadGraphGAT
-    from dataset  import (RadGraphDatasetWithClinical,
-                          load_graphs_from_directory,
-                          load_split_indices)
-    from torch_geometric.loader import DataLoader
-    from evaluate import full_evaluation, extract_attention_weights
-    from train    import _build_optimizer
-    from utils    import load_checkpoint, save_predictions
-
-    device      = get_device(config.USE_CUDA)
-    clinical_df = pd.read_csv(config.CLINICAL_DATA_FILE)
-
-    # Load graphs + test split
-    graphs    = load_graphs_from_directory(config.OUTPUT_DIR / 'graphs', task=task)
-    splits    = load_split_indices(config.OUTPUT_DIR / 'splits', task)
-    test_ids  = splits.get('test', [])
-
-    test_graphs = ([g for g in graphs if getattr(g, 'patient_id', '') in test_ids]
-                   if test_ids else graphs)
-
-    test_ds  = RadGraphDatasetWithClinical(test_graphs, clinical_df)
-    test_ldr = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
-
-    # Load model
-    best_model_path = config.MODEL_DIR / f'best_model_{task}.pth'
-    if not best_model_path.exists():
-        print(f"Trained model not found at {best_model_path}. Train first.")
-        return
-
-    model     = RadGraphGAT().to(device)
-    optimizer = _build_optimizer(model)
-    load_checkpoint(model, optimizer, best_model_path)
-
-    metrics, y_true, y_prob = full_evaluation(
-        model, test_ldr, device,
-        task=task, save_dir=config.OUTPUT_DIR
-    )
-
-    test_pids = [getattr(g, 'patient_id', str(i)) for i, g in enumerate(test_graphs)]
-    threshold = metrics.get('threshold', 0.5)
-    y_pred    = (y_prob >= threshold).astype(int)
-    save_predictions(test_pids, y_true, y_prob, y_pred,
-                     config.OUTPUT_DIR / f'test_predictions_{task}.csv')
-
-    if extract_attention:
-        print("\nExtracting attention weights...")
-        extract_attention_weights(model, test_ldr, device,
-                                  task=task, save_dir=config.ATTENTION_MAPS_DIR)
-
-    print(f"\n✓ Evaluation complete — AUC: {metrics['auc']:.4f}")
-    return metrics
-
-
-# ─── Stage 6: Compare ────────────────────────────────────────────────────────
-
-def run_comparison(task='LR'):
-    """Build comparison table: GAT vs Baseline."""
-    print_banner("Stage 6: Model Comparison")
-
-    from evaluate import compare_with_baseline
-    comparison_df = compare_with_baseline(task=task, save_dir=config.OUTPUT_DIR)
-    print("\n✓ Comparison complete")
-    return comparison_df
-
-
-# ─── Utility ──────────────────────────────────────────────────────────────────
-
-def print_banner(text):
-    print(f"\n{'='*70}")
-    print(f"  {text}")
-    print(f"{'='*70}")
-
-
-def get_patient_ids():
-    """Load and filter patient IDs from clinical CSV."""
-    from data_loader import HNSCCDataLoader
-    loader = HNSCCDataLoader(config.CT_SCANS_DIR,
-                             config.RTSTRUCT_DIR,
-                             config.CLINICAL_DATA_FILE)
-    return loader.filter_patients_by_followup(config.MIN_FOLLOWUP_MONTHS)
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── CLI entry point ──────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description='RadGraph GAT — Full Pipeline Orchestrator',
+        description='Baseline RF — Appendix S1 pipeline',
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples:
-  python main.py --task LR --stage baseline          # Quick baseline (no CT needed)
-  python main.py --task LR --all                     # Full pipeline
-  python main.py --task LR --from_stage graph        # Skip preprocessing
-  python main.py --task LR --stage train             # Train only
-  python main.py --task LR --stage evaluate --attention --compare
+  # Radiomics baseline (traditional radiomics)
+  python main_simple.py --task LR --split_data --train --evaluate
+
+  # Clinical-only baseline (paper's clinical baseline)
+  python main_simple.py --task LR --split_data --clinical_baseline --train --evaluate
+
+  # Both baselines on the same split
+  python main_simple.py --task LR --split_data --train --evaluate
+  python main_simple.py --task LR --clinical_baseline --train --evaluate
         """
     )
-
-    parser.add_argument('--task',        type=str, default='LR', choices=['LR', 'DM'],
-                        help='Prediction task: LR (locoregional) or DM (distant metastasis)')
-    parser.add_argument('--stage',       type=str, default=None,
-                        choices=['baseline', 'preprocess', 'extract',
-                                 'graph', 'train', 'evaluate', 'compare'],
-                        help='Run a single specific stage')
-    parser.add_argument('--from_stage',  type=str, default=None,
-                        choices=['baseline', 'preprocess', 'extract',
-                                 'graph', 'train', 'evaluate', 'compare'],
-                        help='Run from this stage to the end')
-    parser.add_argument('--all',         action='store_true',
-                        help='Run all stages in sequence')
-    parser.add_argument('--use_kfold',   action='store_true',
-                        help='Use K-fold cross-validation in training stage')
-    parser.add_argument('--n_folds',     type=int, default=5,
-                        help='Number of folds for K-fold CV')
-    parser.add_argument('--attention',   action='store_true',
-                        help='Extract attention weights during evaluation')
-    parser.add_argument('--compare',     action='store_true',
-                        help='Generate GAT vs Baseline comparison table')
-    parser.add_argument('--skip_existing', action='store_true', default=True,
-                        help='Skip patients with existing cached files')
-
+    parser.add_argument('--task',             type=str, default='LR',
+                        choices=['LR', 'DM'])
+    parser.add_argument('--split_data',       action='store_true',
+                        help='Create and save train/val/test split')
+    parser.add_argument('--train',            action='store_true',
+                        help='Train the RF model')
+    parser.add_argument('--evaluate',         action='store_true',
+                        help='Evaluate on test set')
+    parser.add_argument('--clinical_baseline',action='store_true',
+                        help='Train clinical-only RF baseline instead of radiomics RF.\n'
+                             'Paper: "A clinical baseline... trained solely on\n'
+                             'clinical variables" (Statistical Analysis section)')
+    parser.add_argument('--fast',             action='store_true',
+                        help='Fast mode: skip exhaustive grid search')
     args = parser.parse_args()
 
-    # Determine which stages to run
-    STAGE_ORDER = ['baseline', 'preprocess', 'extract', 'graph', 'train', 'evaluate', 'compare']
-
-    if args.all:
-        stages_to_run = STAGE_ORDER
-    elif args.from_stage:
-        start_idx     = STAGE_ORDER.index(args.from_stage)
-        stages_to_run = STAGE_ORDER[start_idx:]
-    elif args.stage:
-        stages_to_run = [args.stage]
-    else:
-        print("No stage specified. Use --stage, --from_stage, or --all.")
-        parser.print_help()
-        return
-
-    # Setup
     set_seed(config.RANDOM_SEED)
+    outcome_col = config.get_outcome_column(args.task)
+
+    # ── Load data ────────────────────────────────────────────────────────────
+    data_df = load_data()
+
+    exclude_cols = ([config.PATIENT_ID_COL, config.OUTCOME_LR,
+                     config.OUTCOME_DM, config.FOLLOWUP_TIME]
+                    + config.CLINICAL_FEATURES)
+    feature_cols = [c for c in data_df.columns if c not in exclude_cols]
+
+    patient_ids = data_df[config.PATIENT_ID_COL].values
+    X_raw       = data_df[feature_cols]
+    y           = data_df[outcome_col].values
+
+    print(f"\nOutcome ({args.task}): "
+          f"{(y==0).sum()} negative, {(y==1).sum()} positive")
+
+    # ── Clinical-only baseline path ───────────────────────────────────────────
+    if args.clinical_baseline:
+        # Load saved split indices if they exist
+        split_dir  = config.OUTPUT_DIR / 'splits'
+        ids_train_ = ids_val_ = ids_test_ = None
+        if (split_dir / f'train_ids_{args.task}.npy').exists():
+            ids_train_ = np.load(split_dir / f'train_ids_{args.task}.npy',
+                                 allow_pickle=True)
+            ids_val_   = np.load(split_dir / f'val_ids_{args.task}.npy',
+                                 allow_pickle=True)
+            ids_test_  = np.load(split_dir / f'test_ids_{args.task}.npy',
+                                 allow_pickle=True)
+            print("Using existing train/val/test split for clinical baseline.")
+
+        clinical_df = pd.read_csv(config.CLINICAL_DATA_FILE)
+
+        if args.train:
+            train_clinical_baseline(
+                clinical_df  = clinical_df,
+                outcome_col  = outcome_col,
+                task         = args.task,
+                ids_train    = ids_train_,
+                ids_val      = ids_val_,
+                ids_test     = ids_test_
+            )
+        return   # Clinical baseline is complete
+
+    # ── Radiomics baseline path ───────────────────────────────────────────────
+    # ── Split ─────────────────────────────────────────────────────────────────
+    if args.split_data or args.train:
+        X_tv, X_test, y_tv, y_test, ids_tv, ids_test = train_test_split(
+            X_raw, y, patient_ids,
+            test_size=config.TEST_RATIO,
+            stratify=y, random_state=config.RANDOM_SEED
+        )
+        val_adj = config.VAL_RATIO / (config.TRAIN_RATIO + config.VAL_RATIO)
+        X_train, X_val, y_train, y_val, ids_train, ids_val = train_test_split(
+            X_tv, y_tv, ids_tv,
+            test_size=val_adj,
+            stratify=y_tv, random_state=config.RANDOM_SEED
+        )
+        print(f"\nTrain: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
+
+        # Min-max normalise radiomic features (Appendix S1)
+        print("\nMin-max normalising radiomic features to [0, 1] (Appendix S1)...")
+        scaler  = MinMaxScaler(feature_range=(0, 1))
+        X_train = pd.DataFrame(
+            scaler.fit_transform(X_train), columns=feature_cols
+        )
+        X_val  = pd.DataFrame(scaler.transform(X_val),  columns=feature_cols)
+        X_test = pd.DataFrame(scaler.transform(X_test), columns=feature_cols)
+
+        config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        joblib.dump(scaler,
+                    config.MODEL_DIR / f'minmax_scaler_{args.task}.pkl')
+
+        split_dir = config.OUTPUT_DIR / 'splits'
+        split_dir.mkdir(exist_ok=True)
+        np.save(split_dir / f'train_ids_{args.task}.npy', ids_train)
+        np.save(split_dir / f'val_ids_{args.task}.npy',   ids_val)
+        np.save(split_dir / f'test_ids_{args.task}.npy',  ids_test)
+
+    if args.train:
+        # mRMR candidate selection
+        print(f"\n=== Step 1: mRMR — select 20 candidates ===")
+        candidates = mrmr_select_candidates(X_train, y_train, n_candidates=20)
+
+        if args.fast:
+            print("  [FAST MODE] Skipping full grid search.")
+            n_target      = config.get_n_features_for_task(args.task)
+            best_features = candidates[:n_target]
+            best_sampling = 'intermediate'
+            best_val_auc  = 0.0
+        else:
+            print(f"\n=== Step 2: Grid search (all combos × 3 samplings) ===")
+            best_features, best_sampling, best_val_auc = \
+                select_best_features_and_sampling(
+                    X_train, y_train, X_val, y_val,
+                    candidates, task=args.task
+                )
+
+        model = train_final_rf(
+            X_train, y_train, X_val, y_val,
+            best_features, best_sampling, task=args.task
+        )
+
+        config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model,
+                    config.MODEL_DIR / f'baseline_model_{args.task}.pkl')
+        joblib.dump({'features': best_features, 'sampling': best_sampling},
+                    config.MODEL_DIR / f'baseline_config_{args.task}.pkl')
+
+        feat_file = config.OUTPUT_DIR / f'selected_features_{args.task}.txt'
+        with open(feat_file, 'w') as f:
+            f.write(f"# Task: {args.task}\n")
+            f.write(f"# Sampling strategy: {best_sampling}\n")
+            f.write(f"# Validation AUC: {best_val_auc:.4f}\n")
+            for feat in best_features:
+                f.write(f"{feat}\n")
+        print(f"\nSelected features saved to {feat_file}")
+
+    if args.evaluate:
+        model_file  = config.MODEL_DIR / f'baseline_model_{args.task}.pkl'
+        config_file = config.MODEL_DIR / f'baseline_config_{args.task}.pkl'
+        scaler_file = config.MODEL_DIR / f'minmax_scaler_{args.task}.pkl'
+
+        if not model_file.exists():
+            print(f"Model not found. Train first: "
+                  f"python main_simple.py --task {args.task} --split_data --train")
+            return
+
+        model         = joblib.load(model_file)
+        best_cfg      = joblib.load(config_file)
+        best_features = best_cfg['features']
+        scaler        = joblib.load(scaler_file)
+
+        split_dir = config.OUTPUT_DIR / 'splits'
+        ids_test  = np.load(split_dir / f'test_ids_{args.task}.npy',
+                            allow_pickle=True)
+
+        data_df2   = load_data()
+        test_mask  = data_df2[config.PATIENT_ID_COL].isin(ids_test)
+        X_test_raw = data_df2[test_mask][feature_cols]
+        y_test     = data_df2[test_mask][outcome_col].values
+
+        X_test_norm = pd.DataFrame(
+            scaler.transform(X_test_raw), columns=feature_cols
+        )
+        X_test_sel  = X_test_norm[best_features]
+
+        y_prob = model.predict_proba(X_test_sel.values)[:, 1]
+        y_pred = (y_prob >= 0.5).astype(int)
+
+        test_m = calculate_metrics(y_test, y_pred, y_prob, threshold=0.5)
+        print_metrics(test_m, f"Radiomics Baseline Test ({args.task})")
+        print("\nNote: threshold=0.5 per Appendix S1. AUC is primary metric.")
+
+        results_df = pd.DataFrame({
+            'patient_id'     : ids_test,
+            'true_label'     : y_test,
+            'predicted_prob' : y_prob,
+            'predicted_label': y_pred,
+            'model'          : 'radiomics_baseline'
+        })
+        results_file = config.OUTPUT_DIR / f'test_results_{args.task}.csv'
+        results_df.to_csv(results_file, index=False)
+        print(f"\nPredictions saved to {results_file}")
+
+        plot_roc_curve(y_test, y_prob,
+                       config.OUTPUT_DIR / f'roc_curve_{args.task}.png')
+        plot_confusion_matrix(y_test, y_pred,
+                              config.OUTPUT_DIR / f'confusion_matrix_{args.task}.png')
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+def load_data():
+    """
+    Load your existing radiomics features and clinical data
+    
+    Returns:
+    --------
+    data : dict
+        Dictionary with features, labels, and patient IDs
+    """
+    print("Loading data...")
+    
+    # Load radiomics features (YOUR EXTRACTED FEATURES)
+    radiomics_df = pd.read_csv(config.RADIOMICS_FEATURES_FILE)
+    print(f"Loaded radiomics features: {radiomics_df.shape}")
+    
+    # Load clinical data
+    clinical_df = pd.read_csv(config.CLINICAL_DATA_FILE)
+    print(f"Loaded clinical data: {clinical_df.shape}")
+    
+    # Merge on patient ID
+    merged_df = pd.merge(
+        radiomics_df,
+        clinical_df,
+        on=config.PATIENT_ID_COL,
+        how='inner'
+    )
+    
+    print(f"Merged data: {merged_df.shape}")
+    
+    # Filter by follow-up time
+    if config.FOLLOWUP_TIME in merged_df.columns:
+        merged_df = merged_df[merged_df[config.FOLLOWUP_TIME] >= config.MIN_FOLLOWUP_MONTHS]
+        print(f"After follow-up filter: {merged_df.shape}")
+    
+    return merged_df
+
+
+def select_features_simple(X_train, y_train, X_val, y_val, task='LR'):
+    """
+    Simple feature selection using Random Forest feature importance
+    
+    Parameters:
+    -----------
+    X_train, y_train : training data
+    X_val, y_val : validation data
+    task : str ('LR' or 'DM')
+    
+    Returns:
+    --------
+    selected_features : list
+        List of selected feature names
+    """
+    print(f"\nFeature selection for {task}...")
+    
+    n_features_target = config.get_n_features_for_task(task)
+    
+    # Train Random Forest for feature importance
+    rf = RandomForestClassifier(
+        n_estimators=config.RF_N_ESTIMATORS,
+        max_depth=config.RF_MAX_DEPTH,
+        random_state=config.RF_RANDOM_STATE,
+        n_jobs=-1
+    )
+    
+    rf.fit(X_train, y_train)
+    
+    # Get feature importances
+    importances = rf.feature_importances_
+    feature_names = X_train.columns.tolist()
+    
+    # Sort by importance
+    indices = np.argsort(importances)[::-1]
+    
+    # Try different numbers of features
+    best_auc = 0
+    best_n_features = n_features_target
+    
+    for n_feat in range(2, min(21, len(feature_names))):
+        selected_idx = indices[:n_feat]
+        selected_cols = [feature_names[i] for i in selected_idx]
+        
+        # Train and evaluate
+        rf_temp = RandomForestClassifier(
+            n_estimators=50,
+            random_state=config.RF_RANDOM_STATE
+        )
+        rf_temp.fit(X_train[selected_cols], y_train)
+        y_pred = rf_temp.predict_proba(X_val[selected_cols])[:, 1]
+        auc = roc_auc_score(y_val, y_pred)
+        
+        if auc > best_auc:
+            best_auc = auc
+            best_n_features = n_feat
+    
+    # Select best features
+    selected_idx = indices[:best_n_features]
+    selected_features = [feature_names[i] for i in selected_idx]
+    
+    print(f"Selected {len(selected_features)} features (target: {n_features_target})")
+    print(f"Validation AUC: {best_auc:.4f}")
+    print(f"Features: {selected_features}")
+    
+    return selected_features
+
+
+def build_simple_graph(patient_features_dict, selected_features):
+    """
+    Build a simplified graph for one patient
+    Since you don't have supervoxels yet, we'll create a simple baseline
+    
+    Parameters:
+    -----------
+    patient_features_dict : dict
+        Dictionary with GTV features (from your radiomics file)
+    selected_features : list
+        List of selected feature names
+    
+    Returns:
+    --------
+    graph_data : dict
+        Simple representation with just GTV features (to be extended later)
+    """
+    # For now, just return GTV features
+    # Later you'll add supervoxel features when available
+    
+    gtv_features = np.array([patient_features_dict[feat] for feat in selected_features])
+    
+    return {
+        'gtv_features': gtv_features,
+        'n_features': len(selected_features)
+    }
+
+
+def train_baseline_model(X_train, y_train, X_val, y_val, selected_features, task='LR'):
+    """
+    Train a baseline Random Forest model
+    
+    This is a simplified version without graphs
+    You can extend this to use graphs later
+    """
+    print(f"\n{'='*60}")
+    print(f"Training Baseline Model for {task}")
+    print(f"{'='*60}")
+    
+    # Filter to selected features
+    X_train_sel = X_train[selected_features]
+    X_val_sel = X_val[selected_features]
+    
+    # Handle class imbalance
+    pos_weight = compute_class_weights(y_train)
+    
+    # Train Random Forest with class weights
+    class_weights = {0: 1.0, 1: pos_weight}
+    
+    rf = RandomForestClassifier(
+        n_estimators=config.RF_N_ESTIMATORS * 2,  # More trees for better performance
+        max_depth=config.RF_MAX_DEPTH,
+        random_state=config.RF_RANDOM_STATE,
+        class_weight=class_weights,
+        n_jobs=-1
+    )
+    
+    print("Training...")
+    rf.fit(X_train_sel, y_train)
+    
+    # Evaluate on training set
+    y_train_pred = rf.predict(X_train_sel)
+    y_train_prob = rf.predict_proba(X_train_sel)[:, 1]
+    train_metrics = calculate_metrics(y_train, y_train_pred, y_train_prob)
+    print_metrics(train_metrics, "Training")
+    
+    # Evaluate on validation set
+    y_val_pred = rf.predict(X_val_sel)
+    y_val_prob = rf.predict_proba(X_val_sel)[:, 1]
+    val_metrics = calculate_metrics(y_val, y_val_pred, y_val_prob)
+    print_metrics(val_metrics, "Validation")
+    
+    return rf, val_metrics
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Simplified RadGraph - Using Existing Features')
+    parser.add_argument('--task', type=str, default='LR', choices=['LR', 'DM'],
+                       help='Prediction task')
+    parser.add_argument('--split_data', action='store_true',
+                       help='Create train/val/test split')
+    parser.add_argument('--train', action='store_true',
+                       help='Train model')
+    parser.add_argument('--evaluate', action='store_true',
+                       help='Evaluate on test set')
+    
+    args = parser.parse_args()
+    
+    # Set seed for reproducibility
+    set_seed(config.RANDOM_SEED)
+    
+    # Update config for task
     config.TASK = args.task
-
-    print(f"""
-╔══════════════════════════════════════════════════════════════════╗
-║           RadGraph GAT — CMC Vellore Implementation              ║
-║           Task: {args.task:<6}  |  Stages: {', '.join(stages_to_run):<30}║
-╚══════════════════════════════════════════════════════════════════╝
-    """)
-
-    start_time  = time.time()
-    patient_ids = None
-
-    for stage in stages_to_run:
-
-        stage_start = time.time()
-
-        if stage == 'baseline':
-            run_baseline(task=args.task)
-
-        elif stage == 'preprocess':
-            if patient_ids is None:
-                patient_ids = get_patient_ids()
-            run_preprocess(patient_ids)
-
-        elif stage == 'extract':
-            if patient_ids is None:
-                patient_ids = get_patient_ids()
-            run_feature_extraction(patient_ids, skip_existing=args.skip_existing)
-
-        elif stage == 'graph':
-            run_graph_building(task=args.task)
-
-        elif stage == 'train':
-            run_training(task=args.task,
-                         use_kfold=args.use_kfold,
-                         n_folds=args.n_folds)
-
-        elif stage == 'evaluate':
-            run_evaluation(task=args.task,
-                           extract_attention=args.attention)
-
-        elif stage == 'compare':
-            run_comparison(task=args.task)
-
-        stage_time = time.time() - stage_start
-        print(f"\n  [Stage '{stage}' completed in {stage_time:.0f}s]")
-
-    total_time = time.time() - start_time
-    print(f"\n{'='*70}")
-    print(f"  Pipeline complete in {total_time:.0f}s  ({total_time/60:.1f} min)")
-    print(f"  Results saved to: {config.OUTPUT_DIR}")
-    print(f"{'='*70}")
+    outcome_col = config.get_outcome_column(args.task)
+    
+    # Load data
+    data_df = load_data()
+    
+    # Get patient IDs
+    patient_ids = data_df[config.PATIENT_ID_COL].values
+    
+    # Separate features and labels
+    # Exclude patient ID, outcomes, and clinical features
+    exclude_cols = [config.PATIENT_ID_COL, config.OUTCOME_LR, config.OUTCOME_DM, 
+                   config.FOLLOWUP_TIME] + config.CLINICAL_FEATURES
+    
+    feature_cols = [col for col in data_df.columns if col not in exclude_cols]
+    
+    print(f"\nNumber of radiomic features: {len(feature_cols)}")
+    
+    X = data_df[feature_cols]
+    y = data_df[outcome_col].values
+    clinical = data_df[config.CLINICAL_FEATURES]
+    
+    print(f"\nOutcome distribution for {args.task}:")
+    print(f"  Negative: {(y==0).sum()} ({(y==0).sum()/len(y)*100:.1f}%)")
+    print(f"  Positive: {(y==1).sum()} ({(y==1).sum()/len(y)*100:.1f}%)")
+    
+    # Data splitting
+    if args.split_data or args.train:
+        print("\nSplitting data...")
+        
+        # First split: train+val vs test
+        X_trainval, X_test, y_trainval, y_test, ids_trainval, ids_test = train_test_split(
+            X, y, patient_ids,
+            test_size=config.TEST_RATIO,
+            random_state=config.RANDOM_SEED,
+            stratify=y
+        )
+        
+        # Second split: train vs val
+        val_ratio_adjusted = config.VAL_RATIO / (config.TRAIN_RATIO + config.VAL_RATIO)
+        X_train, X_val, y_train, y_val, ids_train, ids_val = train_test_split(
+            X_trainval, y_trainval, ids_trainval,
+            test_size=val_ratio_adjusted,
+            random_state=config.RANDOM_SEED,
+            stratify=y_trainval
+        )
+        
+        print(f"Train: {len(X_train)} patients")
+        print(f"Val:   {len(X_val)} patients")
+        print(f"Test:  {len(X_test)} patients")
+        
+        # Save splits
+        split_dir = config.OUTPUT_DIR / 'splits'
+        split_dir.mkdir(exist_ok=True)
+        
+        np.save(split_dir / f'train_ids_{args.task}.npy', ids_train)
+        np.save(split_dir / f'val_ids_{args.task}.npy', ids_val)
+        np.save(split_dir / f'test_ids_{args.task}.npy', ids_test)
+        
+        print(f"Splits saved to {split_dir}")
+    
+    if args.train:
+        # Feature selection
+        selected_features = select_features_simple(X_train, y_train, X_val, y_val, args.task)
+        
+        # Save selected features
+        feature_file = config.OUTPUT_DIR / f'selected_features_{args.task}.txt'
+        with open(feature_file, 'w') as f:
+            for feat in selected_features:
+                f.write(f"{feat}\n")
+        print(f"\nSelected features saved to {feature_file}")
+        
+        # Train model
+        model, val_metrics = train_baseline_model(
+            X_train, y_train, X_val, y_val, 
+            selected_features, args.task
+        )
+        
+        # Save model
+        import joblib
+        model_file = config.MODEL_DIR / f'baseline_model_{args.task}.pkl'
+        joblib.dump(model, model_file)
+        print(f"\nModel saved to {model_file}")
+    
+    if args.evaluate:
+        import joblib
+        
+        # Load model
+        model_file = config.MODEL_DIR / f'baseline_model_{args.task}.pkl'
+        if not model_file.exists():
+            print(f"Model not found: {model_file}")
+            print("Please train first with: python main_simple.py --task {args.task} --train")
+            return
+        
+        model = joblib.load(model_file)
+        print(f"Loaded model from {model_file}")
+        
+        # Load selected features
+        feature_file = config.OUTPUT_DIR / f'selected_features_{args.task}.txt'
+        with open(feature_file, 'r') as f:
+            selected_features = [line.strip() for line in f]
+        
+        # Load test split
+        split_dir = config.OUTPUT_DIR / 'splits'
+        ids_test = np.load(split_dir / f'test_ids_{args.task}.npy')
+        
+        # Get test data
+        test_mask = data_df[config.PATIENT_ID_COL].isin(ids_test)
+        X_test = data_df[test_mask][selected_features]
+        y_test = data_df[test_mask][outcome_col].values
+        
+        print(f"\nEvaluating on {len(X_test)} test patients...")
+        
+        # Predict
+        y_test_pred = model.predict(X_test)
+        y_test_prob = model.predict_proba(X_test)[:, 1]
+        
+        # Calculate metrics
+        test_metrics = calculate_metrics(y_test, y_test_pred, y_test_prob)
+        print_metrics(test_metrics, "Test Set")
+        
+        # Save results
+        results_df = pd.DataFrame({
+            'patient_id': ids_test,
+            'true_label': y_test,
+            'predicted_prob': y_test_prob,
+            'predicted_label': y_test_pred
+        })
+        
+        results_file = config.OUTPUT_DIR / f'test_results_{args.task}.csv'
+        results_df.to_csv(results_file, index=False)
+        print(f"\nResults saved to {results_file}")
+        
+        # Plot ROC curve
+        from utils import plot_roc_curve, plot_confusion_matrix
+        
+        roc_file = config.OUTPUT_DIR / f'roc_curve_{args.task}.png'
+        plot_roc_curve(y_test, y_test_prob, save_path=roc_file)
+        
+        cm_file = config.OUTPUT_DIR / f'confusion_matrix_{args.task}.png'
+        plot_confusion_matrix(y_test, y_test_pred, save_path=cm_file)
 
 
 if __name__ == '__main__':
