@@ -7,11 +7,11 @@ import pandas as pd
 import torch
 import random
 import os
-from pathlib import Path
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score
 import matplotlib.pyplot as plt
 import seaborn as sns
+import config
 
 def set_seed(seed=42):
     """
@@ -129,11 +129,12 @@ def calculate_metrics(y_true, y_pred, y_prob, threshold=0.5):
     # AUC
     try:
         auc = roc_auc_score(y_true, y_prob)
-    except:
+    except ValueError:
+        # Raised when only one class present in y_true
         auc = 0.0
     
-    # Confusion matrix
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    # labels=[0,1] forces a 2×2 matrix even if model predicts only one class
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     
     # Metrics
     accuracy = accuracy_score(y_true, y_pred)
@@ -222,7 +223,8 @@ def bootstrap_auc(y_true, y_prob, n_bootstrap=1000, confidence_level=0.95):
         try:
             auc = roc_auc_score(y_true[indices], y_prob[indices])
             aucs.append(auc)
-        except:
+        except ValueError:
+            # Single-class bootstrap sample — skip
             continue
     
     # Calculate confidence interval
@@ -263,7 +265,7 @@ def plot_roc_curve(y_true, y_prob, save_path=None):
     plt.tight_layout()
     
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=config.FIGURE_DPI, bbox_inches='tight')
         print(f"ROC curve saved to {save_path}")
     
     plt.close()
@@ -295,7 +297,7 @@ def plot_confusion_matrix(y_true, y_pred, save_path=None):
     plt.tight_layout()
     
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=config.FIGURE_DPI, bbox_inches='tight')
         print(f"Confusion matrix saved to {save_path}")
     
     plt.close()
@@ -334,7 +336,7 @@ def plot_training_history(history, save_path=None):
     plt.tight_layout()
     
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=config.FIGURE_DPI, bbox_inches='tight')
         print(f"Training history saved to {save_path}")
     
     plt.close()
@@ -411,7 +413,7 @@ def load_checkpoint(model, optimizer, checkpoint_path):
     best_val_auc : float
         Best validation AUC
     """
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']
