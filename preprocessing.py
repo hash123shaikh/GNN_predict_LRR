@@ -5,7 +5,6 @@ Handles resampling, normalization, and peritumoral region definition
 
 import numpy as np
 import SimpleITK as sitk
-from scipy import ndimage
 import config
 
 
@@ -21,7 +20,9 @@ class CTPreprocessor:
         target_spacing : tuple
             Target isotropic spacing in mm
         """
-        self.target_spacing = target_spacing
+        # Convert to tuple — SimpleITK SetOutputSpacing requires a sequence,
+        # but config.TARGET_SPACING is a list. Normalise here once.
+        self.target_spacing = tuple(target_spacing)
     
     def resample_image(self, image, interpolator=sitk.sitkLinear):
         """
@@ -55,7 +56,10 @@ class CTPreprocessor:
         resampler.SetOutputDirection(image.GetDirection())
         resampler.SetOutputOrigin(image.GetOrigin())
         resampler.SetTransform(sitk.Transform())
-        resampler.SetDefaultPixelValue(image.GetPixelIDValue())
+        # Use -1000 HU (air) as background for CT voxels outside the original FOV.
+        # GetPixelIDValue() returns the data TYPE enum (e.g. 8 = sitkInt16),
+        # NOT a valid HU value — that was a bug.
+        resampler.SetDefaultPixelValue(-1000)
         resampler.SetInterpolator(interpolator)
         
         resampled = resampler.Execute(image)
@@ -182,17 +186,20 @@ class CTPreprocessor:
         
         return cropped
     
-    def preprocess_patient(self, ct_image, gtv_mask):
+    def preprocess_patient(self, ct_image, gtv_mask, crop=False):
         """
         Complete preprocessing pipeline for one patient
-        
+
         Parameters:
         -----------
         ct_image : SimpleITK.Image
-            Original CT image
         gtv_mask : SimpleITK.Image
-            Original GTV mask
-            
+        crop     : bool
+            If True, crop to the peritumoral bounding box (saves memory).
+            If False (default), keeps full resampled volume.
+            NOTE: crop=False uses ~500MB per patient at 1mm isotropic.
+            Enable crop=True for memory-constrained environments.
+        
         Returns:
         --------
         processed_data : dict
@@ -214,15 +221,17 @@ class CTPreprocessor:
         
         print(f"Peritumoral region bbox: {bbox}")
         
-        # Step 3: Crop to region (optional - saves memory)
-        # ct_cropped = self.crop_to_region(ct_resampled, bbox)
-        # gtv_cropped = self.crop_to_region(gtv_resampled, bbox)
-        # region_cropped = self.crop_to_region(region_mask, bbox)
-        
-        # For now, keep full images
-        ct_cropped = ct_resampled
-        gtv_cropped = gtv_resampled
-        region_cropped = region_mask
+        # Step 3: Optionally crop to peritumoral region (saves memory)
+        if crop:
+            ct_cropped     = self.crop_to_region(ct_resampled,  bbox)
+            gtv_cropped    = self.crop_to_region(gtv_resampled, bbox)
+            region_cropped = self.crop_to_region(region_mask,   bbox)
+            print(f"Cropped to peritumoral region: {ct_cropped.GetSize()}")
+        else:
+            # Keep full resampled images (higher memory, no spatial information lost)
+            ct_cropped     = ct_resampled
+            gtv_cropped    = gtv_resampled
+            region_cropped = region_mask
         
         # Convert to numpy arrays
         ct_array = sitk.GetArrayFromImage(ct_cropped)
