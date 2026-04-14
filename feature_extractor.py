@@ -24,13 +24,11 @@ import numpy as np
 import pandas as pd
 import SimpleITK as sitk
 from pathlib import Path
-import json
 import logging
 import argparse
 from tqdm import tqdm
 
 try:
-    import radiomics
     from radiomics import featureextractor
     HAS_PYRADIOMICS = True
 except ImportError:
@@ -331,6 +329,11 @@ class SupervoxelFeatureExtractor:
             return features, feature_names
 
         except Exception as e:
+            # Log at DEBUG so verbose runs can diagnose failures per-supervoxel
+            # without flooding the console during normal batch extraction
+            logging.getLogger('radgraph.extractor').debug(
+                f"PyRadiomics extraction failed: {type(e).__name__}: {e}"
+            )
             return None, []
 
     @staticmethod
@@ -364,7 +367,7 @@ class SupervoxelFeatureExtractor:
             centroids     = result['centroids'],
             valid_sv_ids  = result['valid_sv_ids'],
             feature_names = np.array(result['feature_names']),
-            n_supervoxels = np.array(result['n_supervoxels'])
+            n_supervoxels = np.array([result['n_supervoxels']])   # 1-D for safe int() loading
         )
 
     @staticmethod
@@ -377,7 +380,7 @@ class SupervoxelFeatureExtractor:
             'centroids'     : data['centroids'],
             'valid_sv_ids'  : data['valid_sv_ids'],
             'feature_names' : list(data['feature_names']),
-            'n_supervoxels' : int(data['n_supervoxels']),
+            'n_supervoxels' : int(data['n_supervoxels'][0]),   # stored as 1-D array
         }
 
 
@@ -399,12 +402,15 @@ def preprocess_and_save_all(patient_ids, loader, preprocessor, sv_generator, sav
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    failed = []
+    failed  = []
+    saved   = 0
+    skipped = 0
 
     for patient_id in tqdm(patient_ids, desc='Preprocessing + supervoxels'):
         out_file = save_dir / f'{patient_id}_preprocessed.npz'
 
         if out_file.exists():
+            skipped += 1
             continue
 
         try:
@@ -436,12 +442,16 @@ def preprocess_and_save_all(patient_ids, loader, preprocessor, sv_generator, sav
                 supervoxel_labels = sv_labels.astype(np.int32),
                 spacing           = np.array(config.TARGET_SPACING, dtype=np.float32)
             )
+            saved += 1
 
         except Exception as e:
             print(f"  ERROR preprocessing {patient_id}: {e}")
             failed.append(patient_id)
 
-    print(f"\nPreprocessing done. {len(patient_ids) - len(failed)} saved, {len(failed)} failed.")
+    print(f"\nPreprocessing done.")
+    print(f"  Newly saved : {saved}")
+    print(f"  Skipped     : {skipped}  (already existed)")
+    print(f"  Failed      : {len(failed)}")
     return failed
 
 
@@ -455,6 +465,8 @@ def main():
                         help='Process all patients in clinical data')
     parser.add_argument('--skip_existing', action='store_true', default=True,
                         help='Skip patients already in cache (default: True)')
+    parser.add_argument('--no_skip', action='store_true', default=False,
+                        help='Re-extract features even if already cached')
     parser.add_argument('--preprocessed_dir', type=str,
                         default=str(config.OUTPUT_DIR / 'preprocessed'),
                         help='Directory with preprocessed .npz files')
@@ -474,6 +486,8 @@ def main():
     extractor    = SupervoxelFeatureExtractor()
 
     preprocessed_dir = Path(args.preprocessed_dir)
+    # --no_skip overrides the default skip_existing=True
+    skip_existing = not args.no_skip
 
     if args.all_patients:
         patient_ids = loader.filter_patients_by_followup(config.MIN_FOLLOWUP_MONTHS)
@@ -485,9 +499,9 @@ def main():
         # Step 2: Feature extraction
         print("\n=== Step 2: Feature Extraction ===")
         results, failed = extractor.extract_all_patients(
-            patient_ids          = patient_ids,
+            patient_ids           = patient_ids,
             preprocessed_data_dir = preprocessed_dir,
-            skip_existing        = args.skip_existing
+            skip_existing         = skip_existing
         )
 
         # Save GTV features to CSV (for baseline comparison)
