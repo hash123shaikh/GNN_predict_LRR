@@ -130,16 +130,19 @@ class RadGraphGAT(nn.Module):
         dropout             = None,
         negative_slope      = None,
         use_clinical        = True,
+        task                = 'LR',   # used to auto-load Table S2 defaults
     ):
         super().__init__()
 
-        # Defaults from config
+        # Load Table S2 defaults for this task, then allow overrides
+        gat_cfg = config.get_gat_config(task)
+
         self.node_feature_dim    = node_feature_dim    or config.N_FEATURES_TOTAL
         self.n_clinical_features = n_clinical_features or config.N_CLINICAL_FEATURES
-        self.hidden_dim          = hidden_dim          or config.GAT_HIDDEN_DIM
-        self.n_heads             = n_heads             or config.GAT_N_HEADS
-        self.n_layers            = n_layers            or config.GAT_N_LAYERS
-        self.dropout             = dropout             or config.GAT_DROPOUT
+        self.hidden_dim          = hidden_dim          or gat_cfg['hidden_dim']
+        self.n_heads             = n_heads             or gat_cfg['n_heads']
+        self.n_layers            = n_layers            or gat_cfg['n_layers']
+        self.dropout             = dropout             or gat_cfg['dropout']
         self.neg_slope           = negative_slope      or config.GAT_NEGATIVE_SLOPE
         self.use_clinical        = use_clinical
 
