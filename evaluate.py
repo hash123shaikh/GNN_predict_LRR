@@ -120,7 +120,17 @@ def full_evaluation(model, test_loader, device, task='LR',
 @torch.no_grad()
 def extract_attention_weights(model, test_loader, device, task='LR', save_dir=None):
     """
-    Extract and save per-patient attention weights from the first GAT layer.
+    Extract per-patient attention weights from the FINAL GAT layer.
+
+    Paper (Methods — Graph attention atlas creation):
+      "attention values from the GTV readout node to all other graph nodes
+       were extracted from the final GAT layer of each model studied.
+       These attention values were then matched to corresponding CT
+       supervoxels for each patient."
+
+    Only GTV→SV directed edges are recorded (source = GTV node index 0
+    within each graph), matching the paper's description of attention
+    from the "GTV readout node."
 
     Parameters
     ----------
@@ -132,7 +142,8 @@ def extract_attention_weights(model, test_loader, device, task='LR', save_dir=No
 
     Returns
     -------
-    attention_df : pd.DataFrame  — patient_id, node_id, attention_weight
+    attention_df : pd.DataFrame
+        Columns: patient_id, sv_node_local_idx, attention_weight (mean over heads)
     """
     save_dir = Path(save_dir) if save_dir else config.ATTENTION_MAPS_DIR
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -143,60 +154,74 @@ def extract_attention_weights(model, test_loader, device, task='LR', save_dir=No
     for batch in test_loader:
         batch = batch.to(device)
 
-        # Get attention weights from layer 0
         try:
-            alpha = model.get_attention_weights(batch)  # (E, n_heads)
-        except Exception:
+            # Returns attention from FINAL layer (fixed in model.py)
+            alpha, edge_index_out = model.get_attention_weights(batch)
+        except Exception as e:
+            print(f"  WARNING: Attention extraction failed: {e}")
             continue
 
-        if alpha is None:
+        if alpha is None or edge_index_out is None:
             continue
 
-        # Average over heads
-        alpha_mean = alpha.mean(dim=-1).cpu().numpy()   # (E,)
-        edge_index = batch.edge_index.cpu().numpy()
+        # Average over attention heads: (E, n_heads) → (E,)
+        alpha_mean = alpha.mean(dim=-1).cpu().numpy()
+        src_nodes  = edge_index_out[0].cpu().numpy()
+        dst_nodes  = edge_index_out[1].cpu().numpy()
         batch_vec  = batch.batch.cpu().numpy()
-        pids       = [getattr(batch, 'patient_id', None)]
 
-        # Map edges back to patient graphs
         for g_idx in range(batch.num_graphs):
-            # Find edges belonging to this graph
+            # Find global node indices for this graph
             node_mask = (batch_vec == g_idx)
             node_ids  = np.where(node_mask)[0]
 
-            edge_mask = np.isin(edge_index[0], node_ids)
-            src_nodes = edge_index[0][edge_mask]
-            dst_nodes = edge_index[1][edge_mask]
-            weights   = alpha_mean[edge_mask]
+            if len(node_ids) == 0:
+                continue
 
-            # Only GTV → SV edges (src == first node of graph)
-            gtv_node = node_ids[0]
-            gtv_mask = (src_nodes == gtv_node)
+            # GTV node is always the first node of this graph
+            gtv_global_idx = node_ids[0]
 
-            pid = f'patient_{g_idx}'
+            # Extract only GTV → SV edges (source = GTV node)
+            # Paper: "attention values from the GTV readout node to all
+            #         other graph nodes"
+            gtv_src_mask = (src_nodes == gtv_global_idx)
+
+            # Map destination (SV) global indices to local 1-based indices
+            dst_global = dst_nodes[gtv_src_mask]
+            weights    = alpha_mean[gtv_src_mask]
+
+            # Local index within this patient's graph (1 = first SV, etc.)
+            sv_local_indices = dst_global - gtv_global_idx
+
+            # Patient ID
+            pid = f'graph_{g_idx}'
             if hasattr(batch, 'patient_id'):
                 try:
                     pid = batch.patient_id[g_idx]
                 except Exception:
                     pass
 
-            for sv_local, w in zip(dst_nodes[gtv_mask] - gtv_node, weights[gtv_mask]):
-                records.append({
-                    'patient_id'       : pid,
-                    'sv_node_local_idx': int(sv_local),
-                    'attention_weight' : float(w)
-                })
+            for sv_local, w in zip(sv_local_indices, weights):
+                if sv_local > 0:   # Skip self-loops (GTV→GTV)
+                    records.append({
+                        'patient_id'       : pid,
+                        'sv_node_local_idx': int(sv_local),
+                        'attention_weight' : float(w),
+                        'task'             : task,
+                    })
 
     attention_df = pd.DataFrame(records)
 
     if len(attention_df) > 0:
-        # Save
         attn_csv = save_dir / f'attention_weights_{task}.csv'
         attention_df.to_csv(attn_csv, index=False)
         print(f"Attention weights saved to {attn_csv}")
+        print(f"  Patients: {attention_df['patient_id'].nunique()}")
+        print(f"  Total GTV→SV attention records: {len(attention_df)}")
 
-        # Plot top-K most attended supervoxels across patients
         _plot_attention_distribution(attention_df, task, save_dir)
+    else:
+        print("WARNING: No attention weights extracted.")
 
     return attention_df
 
