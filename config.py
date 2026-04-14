@@ -4,6 +4,7 @@ Adjust paths and parameters according to your data and requirements
 """
 
 import os
+import torch
 from pathlib import Path
 
 # ============================================================================
@@ -31,8 +32,8 @@ for directory in [OUTPUT_DIR, MODEL_DIR, LOGS_DIR]:
 # DATA CONFIGURATION
 # ============================================================================
 
-# Total number of patients
-N_PATIENTS = 176
+# NOTE: Patient count is determined dynamically at runtime from clinical_data.csv
+# Do not hardcode N_PATIENTS here — it will silently diverge from actual data.
 
 # Clinical features to use (column names in your CSV)
 CLINICAL_FEATURES = [
@@ -336,9 +337,14 @@ FIGURE_FORMAT = 'png'  # 'png', 'pdf', or 'svg'
 # COMPUTATIONAL SETTINGS
 # ============================================================================
 
-# Device
+# Device — checked at runtime so CPU machines don't silently fail
 USE_CUDA = True
-DEVICE = 'cuda' if USE_CUDA else 'cpu'
+DEVICE   = 'cuda' if (USE_CUDA and torch.cuda.is_available()) else 'cpu'
+
+if DEVICE == 'cuda':
+    print(f"[config] GPU detected: {torch.cuda.get_device_name(0)}")
+else:
+    print("[config] No GPU detected — using CPU")
 
 # Multi-processing
 NUM_WORKERS = 4  # For data loading
@@ -358,17 +364,18 @@ WANDB_PROJECT = 'radgraph-hnscc'
 WANDB_ENTITY = None  # Your W&B username
 
 # Logging
-LOG_INTERVAL = 10  # Log every N batches
-SAVE_BEST_MODEL = True
-SAVE_CHECKPOINT_EVERY = 10  # Save checkpoint every N epochs
+LOG_INTERVAL          = 10   # Log every N batches
+SAVE_BEST_MODEL       = True
+SAVE_CHECKPOINT_EVERY = 10   # Save checkpoint every N epochs
 
-# Model checkpoint
-CHECKPOINT_PATH = MODEL_DIR / f'checkpoint_{TASK}.pth'
-BEST_MODEL_PATH = MODEL_DIR / f'best_model_{TASK}.pth'
-
-# Results
-RESULTS_FILE = OUTPUT_DIR / f'results_{TASK}.csv'
-PREDICTIONS_FILE = OUTPUT_DIR / f'predictions_{TASK}.csv'
+# NOTE: Model and result paths are task-specific.
+# Use get_model_paths(task) below instead of hardcoded paths.
+# The lines below were removed because they always pointed to LR
+# regardless of the actual task being run:
+#   CHECKPOINT_PATH = MODEL_DIR / f'checkpoint_{TASK}.pth'  ← always LR
+#   BEST_MODEL_PATH = MODEL_DIR / f'best_model_{TASK}.pth'  ← always LR
+#   RESULTS_FILE    = OUTPUT_DIR / f'results_{TASK}.csv'    ← always LR
+#   PREDICTIONS_FILE= OUTPUT_DIR / f'predictions_{TASK}.csv'← always LR
 ATTENTION_MAPS_DIR = OUTPUT_DIR / 'attention_maps'
 
 # Create attention maps directory
@@ -379,25 +386,62 @@ ATTENTION_MAPS_DIR.mkdir(parents=True, exist_ok=True)
 # ============================================================================
 
 def get_n_features_for_task(task):
-    """Get number of features for specific task"""
+    """Get number of features for specific task."""
     return N_FEATURES_LR if task == 'LR' else N_FEATURES_DM
 
+
 def get_outcome_column(task):
-    """Get outcome column name for specific task"""
+    """Get outcome column name for specific task."""
     return OUTCOME_LR if task == 'LR' else OUTCOME_DM
 
-def print_config():
-    """Print current configuration"""
+
+def get_model_paths(task):
+    """
+    Return task-specific file paths for checkpoints and results.
+
+    Replaces the old hardcoded CHECKPOINT_PATH / BEST_MODEL_PATH which
+    always pointed to LR regardless of the actual task being run.
+
+    Parameters
+    ----------
+    task : str  'LR' or 'DM'
+
+    Returns
+    -------
+    paths : dict with keys:
+        checkpoint   — latest checkpoint (saved every N epochs)
+        best_model   — best validation AUC model
+        results      — metrics JSON
+        predictions  — per-patient predictions CSV
+    """
+    return {
+        'checkpoint'  : MODEL_DIR  / f'checkpoint_{task}.pth',
+        'best_model'  : MODEL_DIR  / f'best_model_{task}.pth',
+        'results'     : OUTPUT_DIR / f'metrics_{task}.json',
+        'predictions' : OUTPUT_DIR / f'test_predictions_{task}.csv',
+    }
+
+
+def print_config(task=None):
+    """Print current configuration."""
+    task    = task or TASK
+    gat_cfg = get_gat_config(task)
     print("=" * 80)
     print("RadGraph Configuration")
     print("=" * 80)
-    print(f"Task: {TASK}")
-    print(f"Number of patients: {N_PATIENTS}")
-    print(f"Number of features: {get_n_features_for_task(TASK)}")
-    print(f"GAT Architecture: {GAT_N_LAYERS} layers, {GAT_HIDDEN_DIM} hidden dim, {GAT_N_HEADS} heads")
-    print(f"Training: {N_EPOCHS} epochs, batch size {BATCH_SIZE}, LR {LEARNING_RATE}")
-    print(f"Device: {DEVICE}")
-    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Task                : {task}")
+    print(f"Device              : {DEVICE}")
+    print(f"Selected features   : {get_n_features_for_task(task)}")
+    print(f"GAT layers          : {gat_cfg['n_layers']}")
+    print(f"GAT hidden dim      : {gat_cfg['hidden_dim']}")
+    print(f"GAT attention heads : {gat_cfg['n_heads']}")
+    print(f"GAT dropout         : {gat_cfg['dropout']}")
+    print(f"Learning rate       : {gat_cfg['learning_rate']}")
+    print(f"Batch size          : {gat_cfg['batch_size']}")
+    print(f"Sampling strategy   : {gat_cfg['sampling_strategy']}")
+    print(f"Epochs              : {N_EPOCHS}")
+    print(f"Output directory    : {OUTPUT_DIR}")
+    print(f"Model directory     : {MODEL_DIR}")
     print("=" * 80)
 
 if __name__ == '__main__':
