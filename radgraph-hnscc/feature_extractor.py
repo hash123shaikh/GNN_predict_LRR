@@ -317,6 +317,11 @@ class SupervoxelFeatureExtractor:
                 # Skip diagnostic entries
                 if key.startswith('diagnostics_'):
                     continue
+                # Skip shape features — they describe supervoxel geometry
+                # (volume, surface area, sphericity) not tissue texture.
+                # Joseph: if 'shape' in key: continue
+                if 'shape' in key.lower():
+                    continue
                 try:
                     features.append(float(val))
                     feature_names.append(key)
@@ -427,10 +432,11 @@ def preprocess_and_save_all(patient_ids, loader, preprocessor, sv_generator, sav
                 gtv_mask  = data['gtv_mask']
             )
 
-            # Generate supervoxels
+            # Generate supervoxels — GTV excluded from SLIC region (Joseph's approach)
             sv_labels, _ = sv_generator.generate_supervoxels(
                 ct_array    = processed['ct_array'],
-                region_mask = processed['region_array']
+                region_mask = processed['region_array'],
+                gtv_array   = processed['gtv_array']    # GTV excluded from SLIC
             )
 
             # Save

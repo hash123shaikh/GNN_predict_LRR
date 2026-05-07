@@ -28,69 +28,80 @@ class SupervoxelGenerator:
         self.compactness = compactness
         self.sigma = sigma
     
-    def generate_supervoxels(self, ct_array, region_mask):
+    def generate_supervoxels(self, ct_array, region_mask, gtv_array=None):
         """
-        Generate supervoxels in peritumoral region
-        
+        Generate supervoxels in peritumoral region only.
+
+        Incorporates Joseph's RadiomicsSupervoxels.py approach:
+          - GTV voxels are EXCLUDED from the SLIC region before running.
+            The GTV is treated as its own separate node, not segmented
+            into supervoxels. This means supervoxels only cover peritumoral
+            tissue, matching the paper's intent.
+          - slic_zero=True implements the zero-parameter SLIC described
+            in the paper title. Compactness is automatically adapted
+            per-region rather than being a fixed global value.
+
         Parameters:
         -----------
-        ct_array : numpy array
-            CT image (H x W x D)
-        region_mask : numpy array
-            Binary mask of peritumoral region (H x W x D)
-            
+        ct_array : numpy array  (Z, H, W) — CT HU values
+        region_mask : numpy array  (Z, H, W) — binary peritumoral region mask
+        gtv_array : numpy array or None  (Z, H, W) — binary GTV mask
+            If provided, GTV voxels are removed from the SLIC region so
+            supervoxels are purely peritumoral (Joseph's approach).
+
         Returns:
         --------
         supervoxel_labels : numpy array
-            Label map where each voxel is assigned to a supervoxel ID
-            Shape: (H x W x D), values: 0 (background) or 1 to n_supervoxels
+            Label map: 0 = background, 1..n = peritumoral supervoxels.
+            GTV voxels are set to 0 (not labelled as supervoxels).
         n_supervoxels : int
-            Actual number of supervoxels generated
         """
-        print(f"Generating supervoxels with SLIC...")
-        print(f"  Target segments: {self.n_segments}")
-        print(f"  Compactness: {self.compactness}")
-        print(f"  Sigma: {self.sigma}")
+        print(f"Generating supervoxels with SLIC (slic_zero=True)...")
+        print(f"  Target segments : {self.n_segments}")
+        print(f"  GTV excluded    : {gtv_array is not None}")
         
-        # Normalise CT within the region mask only so background voxels
-        # (-1000 HU air) don't compress the tumour intensity range
-        ct_in_region = ct_array[region_mask > 0]
+        # ── Build peritumoral mask (exclude GTV) ─────────────────────────────
+        # Joseph: boundingbox[mask_array>0] = 0
+        # Supervoxels should only cover peritumoral tissue, not the tumour itself
+        peritumoral_mask = region_mask.copy()
+        if gtv_array is not None:
+            peritumoral_mask[gtv_array > 0] = 0
+
+        # Normalise CT within the peritumoral region only
+        ct_in_region = ct_array[peritumoral_mask > 0]
         if ct_in_region.size == 0:
-            raise ValueError("region_mask is empty — no voxels to process")
-        region_min = ct_in_region.min()
-        region_max = ct_in_region.max()
+            raise ValueError("Peritumoral mask is empty — no voxels to process")
+        region_min    = ct_in_region.min()
+        region_max    = ct_in_region.max()
         ct_normalized = (ct_array - region_min) / (region_max - region_min + 1e-6)
         ct_normalized = np.clip(ct_normalized, 0.0, 1.0)
-        
-        # Apply SLIC only in the region of interest
-        # Mask out regions outside peritumoral area
-        ct_masked = ct_normalized * region_mask
-        
-        # Run SLIC
+
+        # Run SLIC with mask= parameter (Joseph's approach)
+        # slic_zero=True  — zero-parameter SLIC: compactness auto-adapted per region
+        # mask=           — restricts SLIC to the peritumoral region (GTV excluded)
         try:
             labels = slic(
-                ct_masked,
+                ct_normalized,
+                mask              = peritumoral_mask,  # GTV already excluded
                 n_segments        = self.n_segments,
-                compactness       = self.compactness,
-                sigma             = self.sigma,
-                channel_axis      = None,            # replaces deprecated multichannel=False
+                slic_zero         = True,              # zero-parameter SLIC (paper title)
+                channel_axis      = None,
                 enforce_connectivity = True,
-                max_num_iter      = config.SLIC_MAX_ITER,
-                start_label       = 1                # 0 = background
+                start_label       = 1
             )
         except Exception as e:
             print(f"Error in SLIC: {e}")
-            # Fallback: simpler parameters
             labels = slic(
-                ct_masked,
+                ct_normalized,
+                mask         = peritumoral_mask,
                 n_segments   = self.n_segments,
-                compactness  = 10,
-                channel_axis = None,                 # replaces deprecated multichannel=False
+                slic_zero    = True,
+                channel_axis = None,
                 start_label  = 1
             )
-        
-        # Mask out supervoxels outside region
-        labels = labels * region_mask
+
+        # Keep only labels within the peritumoral region
+        labels = labels * peritumoral_mask
         
         # Renumber labels to be contiguous (1, 2, 3, ...)
         labels = self._renumber_labels(labels)
