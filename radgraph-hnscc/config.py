@@ -18,11 +18,14 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 MODEL_DIR = BASE_DIR / "models"
 LOGS_DIR = BASE_DIR / "logs"
 
-# Input data paths - MODIFY THESE
-CT_SCANS_DIR = DATA_DIR / "ct_scans"  # Folder containing patient CT folders
-RTSTRUCT_DIR = DATA_DIR / "rt_structs"  # Folder containing RT structure files
-CLINICAL_DATA_FILE = DATA_DIR / "clinical_data.csv"  # CSV with clinical features
-RADIOMICS_FEATURES_FILE = DATA_DIR / "radiomics_features.csv"  # Your extracted features
+
+# With this single line pointing to the Images folder:
+IMAGES_DIR = Path("/home/radiomicsserver/Downloads/GNN_PREDICT_LRR/1_Idea/radgraph-hnscc/data/MAASTRO/Images") # Folder containing patient CT & RTSTRUCT folders
+
+CT_SCANS_DIR = IMAGES_DIR   # data_loader.py will look for CT/ subfolder inside each patient
+RTSTRUCT_DIR = IMAGES_DIR   # data_loader.py will look for RTSTRUCT/ subfolder inside each patient
+CLINICAL_DATA_FILE      = Path("data/MAASTRO/clinical_features.csv") # Folder containing clinical data
+RADIOMICS_FEATURES_FILE = Path("data/MAASTRO/radiomics_features.csv") # Your extracted features
 
 # Create directories if they don't exist
 for directory in [OUTPUT_DIR, MODEL_DIR, LOGS_DIR]:
@@ -50,7 +53,7 @@ CLINICAL_FEATURES = [
 # Outcome variables (column names in your CSV)
 OUTCOME_LR = 'locoregional_recurrence'  # 0=No, 1=Yes
 OUTCOME_DM = 'distant_metastasis'  # 0=No, 1=Yes
-FOLLOWUP_TIME = 'followup_months'  # Follow-up duration in months
+FOLLOWUP_TIME = 'locoregional_recurrence_in_days'  # days — auto-converted to months in data_loader
 
 # Minimum follow-up required (in months)
 MIN_FOLLOWUP_MONTHS = 24
@@ -70,7 +73,7 @@ INTERPOLATION = 'linear'  # 'linear' or 'nearest'
 PERITUMORAL_MARGIN_MM = 50  # 5cm as in the paper
 
 # GTV contour name patterns (will try these in order)
-GTV_NAMES = ['GTV', 'GTV_Primary', 'GTVp', 'GTV_T', 'CTV', 'GTV1']
+GTV_NAMES = ['GTV', 'GTV_Primary', 'GTVp', 'GTV_T', 'CTV', 'GTV-1', 'GTV-2']
 
 # ============================================================================
 # SUPERVOXEL GENERATION (SLIC)

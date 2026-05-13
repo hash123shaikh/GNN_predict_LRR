@@ -74,23 +74,27 @@ class HNSCCDataLoader:
         """
         # Find patient CT directory
         patient_ct_dir = self.ct_dir / str(patient_id)
-        
+
         if not patient_ct_dir.exists():
-            # Try with different naming conventions
             patient_ct_dir = self.ct_dir / f"Patient_{patient_id}"
             if not patient_ct_dir.exists():
                 patient_ct_dir = self.ct_dir / f"patient_{patient_id}"
-        
+
         if not patient_ct_dir.exists():
             raise ValueError(f"CT directory not found for patient {patient_id}")
-        
+
+        # Handle nested CT/ subfolder (e.g. IMAGES_DIR/HN1004/CT/)
+        ct_subfolder = patient_ct_dir / "CT"
+        if ct_subfolder.exists():
+            patient_ct_dir = ct_subfolder
+
         # Read DICOM series
         reader = sitk.ImageSeriesReader()
         dicom_names = reader.GetGDCMSeriesFileNames(str(patient_ct_dir))
-        
+
         if len(dicom_names) == 0:
             raise ValueError(f"No DICOM files found in {patient_ct_dir}")
-        
+
         reader.SetFileNames(dicom_names)
         ct_image = reader.Execute()
         
@@ -118,13 +122,23 @@ class HNSCCDataLoader:
             f"rtstruct_{patient_id}.dcm",
             f"{patient_id}_rtstruct.dcm"
         ]
-        
+
         for name in possible_names:
             rtstruct_file = self.rtstruct_dir / name
             if rtstruct_file.exists():
                 return rtstruct_file
-        
-        # Fallback: search subdirectories
+
+        # Handle nested RTSTRUCT/ subfolder (e.g. IMAGES_DIR/HN1004/RTSTRUCT/)
+        # Search patient subfolder first — much faster than rglob on full tree
+        patient_rt_dir = self.rtstruct_dir / str(patient_id) / "RTSTRUCT"
+        if patient_rt_dir.exists():
+            for rtstruct_file in patient_rt_dir.glob("*.dcm"):
+                try:
+                    ds = pydicom.dcmread(rtstruct_file, stop_before_pixels=True)
+                    if ds.Modality == 'RTSTRUCT':
+                        return rtstruct_file
+                except Exception:
+                    continue
         # Check filename for common RTSTRUCT prefixes before opening (faster)
         for rtstruct_file in self.rtstruct_dir.rglob(f"*{patient_id}*.dcm"):
             fname_lower = rtstruct_file.name.lower()
@@ -175,8 +189,7 @@ class HNSCCDataLoader:
         # Try using rt-utils if available
         if HAS_RT_UTILS:
             try:
-                # Resolve CT directory using the same naming conventions as
-                # load_ct_scan (Bug fix: was hardcoded to str(patient_id) only)
+                # Resolve CT directory — handle nested CT/ subfolder
                 patient_ct_dir = self.ct_dir / str(patient_id)
                 if not patient_ct_dir.exists():
                     patient_ct_dir = self.ct_dir / f"Patient_{patient_id}"
@@ -186,16 +199,20 @@ class HNSCCDataLoader:
                     raise ValueError(
                         f"CT directory not found for patient {patient_id}"
                     )
-                
+                # Handle nested CT/ subfolder (e.g. IMAGES_DIR/HN1004/CT/)
+                ct_subfolder = patient_ct_dir / "CT"
+                if ct_subfolder.exists():
+                    patient_ct_dir = ct_subfolder
+
                 # Load RT structure
                 rtstruct = RTStructBuilder.create_from(
                     dicom_series_path=str(patient_ct_dir),
                     rt_struct_path=str(rtstruct_file)
                 )
-                
+
                 # Get ROI names
                 roi_names = rtstruct.get_roi_names()
-                
+
                 # Find GTV contour
                 gtv_name = None
                 for name_pattern in config.GTV_NAMES:
@@ -205,21 +222,28 @@ class HNSCCDataLoader:
                             break
                     if gtv_name:
                         break
-                
+
                 if gtv_name is None:
                     print(f"Warning: No GTV contour found for patient {patient_id}")
                     print(f"Available ROIs: {roi_names}")
                     return None, None
-                
-                # Get mask as numpy array
+
+                # Get mask — rt-utils returns (X, Y, Z) numpy array
                 mask_array = rtstruct.get_roi_mask_by_name(gtv_name)
-                
-                # Convert to SimpleITK image
+
+                # SimpleITK GetImageFromArray expects (Z, Y, X) order.
+                # rt-utils returns (X, Y, Z) → transpose to (Z, Y, X)
+                # Without this, CopyInformation fails because the axis
+                # lengths are in the wrong order vs the loaded CT image.
+                if mask_array.ndim == 3:
+                    mask_array = np.transpose(mask_array, (2, 1, 0))
+
+                # Convert to SimpleITK and copy CT metadata
                 gtv_mask = sitk.GetImageFromArray(mask_array.astype(np.uint8))
                 gtv_mask.CopyInformation(ct_image)
-                
+
                 return gtv_mask, gtv_name
-                
+
             except Exception as e:
                 print(f"Error using rt-utils for patient {patient_id}: {e}")
                 return None, None
@@ -372,7 +396,10 @@ class HNSCCDataLoader:
         """
         Filter patients with adequate follow-up.
 
-        Vectorised — single DataFrame operation instead of per-patient loop.
+        Handles both months and days columns automatically:
+          - If FOLLOWUP_TIME column contains 'day', values are treated as days
+            and converted to months (divided by 30.44) before filtering.
+          - Otherwise values are treated as months directly.
 
         Parameters
         ----------
@@ -386,17 +413,18 @@ class HNSCCDataLoader:
         n_total      = len(all_patients)
 
         if config.FOLLOWUP_TIME not in self.clinical_data.columns:
-            # No follow-up column — return all patients with a warning
             print(f"Warning: '{config.FOLLOWUP_TIME}' column not found. "
                   f"Returning all {n_total} patients.")
             return all_patients
 
-        # Vectorised filter — one pass over the DataFrame
-        mask = (
-            self.clinical_data[config.FOLLOWUP_TIME]
-            .fillna(0)                          # Missing → 0 → excluded (Bug 4 fix)
-            >= min_followup_months
-        )
+        followup_values = self.clinical_data[config.FOLLOWUP_TIME].fillna(0)
+
+        # Convert days to months if column name suggests days
+        if 'day' in config.FOLLOWUP_TIME.lower():
+            followup_values = followup_values / 30.44
+            print(f"  Converting '{config.FOLLOWUP_TIME}' from days to months (/30.44)")
+
+        mask = followup_values >= min_followup_months
         valid_ids = self.clinical_data.loc[
             mask, config.PATIENT_ID_COL
         ].tolist()
@@ -405,7 +433,7 @@ class HNSCCDataLoader:
               f"{len(valid_ids)}/{n_total}")
 
         return valid_ids
-    
+
     def load_patient_data(self, patient_id):
         """
         Load complete data for a patient

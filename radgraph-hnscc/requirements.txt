@@ -1,99 +1,122 @@
-# RadGraph Implementation — Python Dependencies
-# Install via install_deps.sh (recommended) or step by step as listed below.
+# ============================================================================
+# RadGraph — Dependency Installation File
+# CMC Vellore | QIRAIL Laboratory | Radiation Oncology
+# ============================================================================
+#
+# CRITICAL: Do NOT run `pip install -r requirements.txt` directly.
+# Three packages require manual pre-installation in a specific order.
+# Follow the steps below exactly.
+#
+# ============================================================================
+# INSTALLATION ORDER (run these commands one at a time)
+# ============================================================================
+#
+#   Step 1 — Create environment
+#   ---------------------------
+#   conda create -n GNNvenv python=3.8 -y
+#   conda activate GNNvenv
+#
+#   Step 2 — NumPy first (everything else depends on it)
+#   -----------------------------------------------------
+#   pip install numpy==1.24.3 setuptools
+#
+#   Step 3 — PyTorch (torch-scatter needs this pre-installed)
+#   ----------------------------------------------------------
+#   pip install torch==2.0.1
+#
+#   Step 4 — PyTorch Geometric extensions (must come before torch-geometric)
+#   -------------------------------------------------------------------------
+#   CPU only:
+#   pip install torch-scatter torch-sparse torch-cluster \
+#       -f https://data.pyg.org/whl/torch-2.0.0+cpu.html
+#
+#   CUDA 11.8 (if GPU available):
+#   pip install torch-scatter torch-sparse torch-cluster \
+#       -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+#
+#   Step 5 — Everything else (this file)
+#   -------------------------------------
+#   pip install -r requirements.txt
+#
+# ============================================================================
 
-# ============================================================================
-# STEP 1: Core dependencies that other packages need
-# ============================================================================
+
+# ── 1. FOUNDATION ────────────────────────────────────────────────────────────
+# Pre-installed manually in Step 2. Listed here so pip skips them if already
+# satisfied. Do not move numpy above torch in any install sequence.
+
 numpy==1.24.3
 setuptools>=65.0
 
-# ============================================================================
-# STEP 2: PyTorch (must be installed before torch-geometric extensions)
-# ============================================================================
-torch==2.0.1
-# torchvision not listed — never imported by this project. torch installs it as a dep.
 
-# ============================================================================
-# STEP 3: Medical imaging (SimpleITK, pydicom, etc.)
-# ============================================================================
+# ── 2. PYTORCH CORE ──────────────────────────────────────────────────────────
+# Pre-installed manually in Step 3.
+
+torch==2.0.1
+
+
+# ── 3. PYTORCH GEOMETRIC ─────────────────────────────────────────────────────
+# torch-scatter, torch-sparse, torch-cluster are pre-installed in Step 4
+# (they cannot be pulled via PyPI — they need the --find-links flag).
+# torch-geometric itself can be installed here once its dependencies exist.
+
+torch-geometric==2.3.1
+
+
+# ── 4. MEDICAL IMAGING ───────────────────────────────────────────────────────
+# CT loading, DICOM parsing, RT structure extraction.
+
 SimpleITK==2.2.1
 pydicom==2.3.1
 rt-utils==1.2.7
 
-# ============================================================================
-# STEP 4: Radiomic feature extraction (needs numpy)
-# ============================================================================
+
+# ── 5. RADIOMIC FEATURE EXTRACTION ───────────────────────────────────────────
+# Requires numpy to be pre-installed (Step 2).
+
 pyradiomics==3.0.1
 
-# ============================================================================
-# STEP 5: PyTorch Geometric (after torch is installed)
-# Note: torch-scatter, torch-sparse, torch-cluster need special installation
-# See installation instructions below
-# ============================================================================
-torch-geometric==2.3.1
 
-# ============================================================================
-# STEP 6: Feature selection and ML
-# ============================================================================
-mrmr-selection==0.2.6
+# ── 6. MACHINE LEARNING ──────────────────────────────────────────────────────
+
 scikit-learn==1.3.0
+mrmr-selection==0.2.6
+joblib==1.3.2
 
-# ============================================================================
-# STEP 7: Image processing
-# ============================================================================
+
+# ── 7. IMAGE PROCESSING ──────────────────────────────────────────────────────
+
 scikit-image==0.21.0
 scipy==1.11.1
 opencv-python==4.8.0
 
-# ============================================================================
-# STEP 8: Data handling
-# ============================================================================
+
+# ── 8. DATA HANDLING ─────────────────────────────────────────────────────────
+
 pandas==2.0.3
 
-# ============================================================================
-# STEP 9: Visualization
-# ============================================================================
+
+# ── 9. VISUALISATION ─────────────────────────────────────────────────────────
+
 matplotlib==3.7.2
 seaborn==0.12.2
 
-# ============================================================================
-# STEP 10: Utilities
-# ============================================================================
+
+# ── 10. UTILITIES ────────────────────────────────────────────────────────────
+
 tqdm==4.65.0
 pyyaml==6.0
-joblib==1.3.2
+
 
 # ============================================================================
-# INSTALLATION INSTRUCTIONS:
-# ============================================================================
-# 
-# METHOD 1 (Recommended - Step by step):
-# ----------------------------------------
-# conda activate GNNvenv
-# pip install numpy==1.24.3 setuptools
-# pip install torch==2.0.1
-# pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.0+cpu.html
-# pip install -r requirements.txt
-#
-# METHOD 2 (One command - if Method 1 fails):
-# -------------------------------------------
-# conda activate GNNvenv
-# bash install_deps.sh
-# (Run the install_deps.sh script that will be provided)
-#
-# ============================================================================
-# TORCH-GEOMETRIC EXTENSIONS INSTALLATION:
+# QUICK VERIFICATION (run after installation)
 # ============================================================================
 #
-# These packages need special installation AFTER torch is installed:
-# - torch-scatter
-# - torch-sparse  
-# - torch-cluster
-#
-# For CPU (your case):
-# pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.0+cpu.html
-#
-# For CUDA 11.8:
-# pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+#   python3 -c "
+#   import torch, torch_geometric, pyradiomics, SimpleITK, sklearn, skimage
+#   print('torch         :', torch.__version__)
+#   print('torch_geometric:', torch_geometric.__version__)
+#   print('All OK')
+#   "
 #
 # ============================================================================
