@@ -198,13 +198,45 @@ def run_graph_building(task='LR'):
     elif train_file.exists():
         # Fit scaler on training patients (from baseline split)
         train_ids = np.load(train_file, allow_pickle=True).tolist()
-        print(f"  Fitting z-score scaler on {len(train_ids)} training patients...")
-        scaler = fit_dataset_scaler(
-            feature_cache_dir = feature_cache_dir,
-            patient_ids       = train_ids,
-            scaler_type       = 'zscore',
-            save_path         = scaler_path
-        )
+
+        # Check whether per-patient .npz files exist
+        npz_count = len(list(feature_cache_dir.glob('*.npz'))) \
+            if feature_cache_dir.exists() else 0
+
+        if npz_count > 0:
+            print(f"  Fitting z-score scaler on {len(train_ids)} training patients "
+                  f"({npz_count} .npz files found)...")
+            scaler = fit_dataset_scaler(
+                feature_cache_dir = feature_cache_dir,
+                patient_ids       = train_ids,
+                scaler_type       = 'zscore',
+                save_path         = scaler_path
+            )
+        else:
+            # Fallback: fit scaler from the GTV features CSV saved by Stage 2
+            csv_path = config.OUTPUT_DIR / 'gtv_features_extracted.csv'
+            if csv_path.exists():
+                print(f"  No .npz files found — fitting scaler from {csv_path.name}...")
+                import pandas as _pd
+                from sklearn.preprocessing import StandardScaler as _SS
+                import joblib as _jl
+                df = _pd.read_csv(csv_path)
+                # Keep only training patients
+                pid_col = config.PATIENT_ID_COL
+                if pid_col in df.columns:
+                    df = df[df[pid_col].isin(train_ids)]
+                feat_cols = [c for c in df.columns
+                             if c not in [pid_col, config.OUTCOME_LR,
+                                         config.OUTCOME_DM, config.FOLLOWUP_TIME]]
+                scaler = _SS()
+                scaler.fit(df[feat_cols].fillna(0).values)
+                config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+                _jl.dump({'scaler': scaler, 'type': 'zscore'}, scaler_path)
+                print(f"  Scaler fitted on {len(df)} patients, {len(feat_cols)} features.")
+                print(f"  Scaler saved to {scaler_path}")
+            else:
+                print("  No .npz files and no gtv_features_extracted.csv found.")
+                print("  Using GTV-relative normalisation (paper method).")
     else:
         print("  No train split found — using GTV-relative normalisation (paper method).")
         print("  Run baseline first (--stage baseline) to create a split,")
@@ -266,13 +298,14 @@ def run_training(task='LR', use_kfold=False, n_folds=5):
     save_split_indices(train_g, val_g, test_g,
                        config.OUTPUT_DIR / 'splits', task)
 
-    train_ds = RadGraphDatasetWithClinical(train_g, clinical_df)
-    scaler   = train_ds.fit_scaler()
+    train_ds  = RadGraphDatasetWithClinical(train_g, clinical_df)
+    scaler    = train_ds.fit_scaler()
+    quant_idx = getattr(train_ds, 'quant_idx', [])
 
     val_ds  = RadGraphDatasetWithClinical(val_g,  clinical_df)
     test_ds = RadGraphDatasetWithClinical(test_g, clinical_df)
-    val_ds.apply_scaler(scaler)
-    test_ds.apply_scaler(scaler)
+    val_ds.apply_scaler(scaler, quant_idx)
+    test_ds.apply_scaler(scaler, quant_idx)
 
     train_loader, val_loader, test_loader = get_data_loaders(
         train_ds, val_ds, test_ds
@@ -281,12 +314,12 @@ def run_training(task='LR', use_kfold=False, n_folds=5):
     pos_weight = train_ds.get_class_weights()
     model      = RadGraphGAT().to(device)
     optimizer  = _build_optimizer(model)
-    scheduler  = _build_scheduler(optimizer)
+    warmup_sch, plateau_sch = _build_scheduler(optimizer)
     criterion  = get_loss_function(pos_weight).to(device)
 
     history, best_path = train_model(
         model, train_loader, val_loader,
-        optimizer, scheduler, criterion, device,
+        optimizer, (warmup_sch, plateau_sch), criterion, device,
         task=task
     )
 

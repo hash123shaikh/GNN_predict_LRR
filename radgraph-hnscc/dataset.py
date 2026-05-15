@@ -105,80 +105,140 @@ class RadGraphDatasetWithClinical(RadGraphDataset):
         self.feature_cols = feature_cols or config.CLINICAL_FEATURES
         self.scaler       = scaler
 
-        # Build patient_id → clinical feature array lookup
-        # Vectorised approach: set_index + to_dict is 10-100x faster than iterrows
-        available_cols = [c for c in self.feature_cols if c in clinical_df.columns]
-        missing_cols   = [c for c in self.feature_cols if c not in clinical_df.columns]
-        if missing_cols:
-            print(f"WARNING: Clinical columns missing from DataFrame: {missing_cols}")
+        # ── Build encoded clinical feature matrix ─────────────────────────
+        # Paper (Appendix S1):
+        #   "Categorical variables were one-hot encoded"
+        #   "Quantitative variables normalised so that values remained between 0 and 1"
+        #
+        # Binary categorical  → 0/1  (one-hot for 2-class is just one binary column)
+        # Multi-class cat.    → proper one-hot using fixed category lists from config.py
+        # Quantitative        → min-max normalised to [0, 1] using training scaler
 
-        lookup_df = (
-            clinical_df
-            .set_index(config.PATIENT_ID_COL)[available_cols]
-            .astype(np.float32)
+        raw_df = clinical_df.set_index(config.PATIENT_ID_COL).copy()
+
+        # ── Step 1: Binary categorical columns (0/1) ─────────────────────
+        BINARY_MAP = {
+            'sex':             {'male': 1, 'female': 0},
+            'hpv_status':      {'positive': 1, 'negative': 0},
+            'concurrent_chemo':{'concomitant': 1, 'concurrent': 1, 'none': 0},
+        }
+        for col, mapping in BINARY_MAP.items():
+            if col in raw_df.columns:
+                raw_df[col] = (
+                    raw_df[col].astype(str).str.lower().str.strip()
+                    .map(mapping).fillna(0).astype(np.float32)
+                )
+
+        # ── Step 2: Multi-class categorical → one-hot ────────────────────
+        # Fixed category lists from config ensure consistent column count
+        # across train/val/test splits regardless of which values appear.
+        for col, categories in config.CATEGORICAL_CLINICAL_ONEHOT.items():
+            if col not in raw_df.columns:
+                continue
+            col_lower = raw_df[col].astype(str).str.lower().str.strip()
+            for cat in categories:
+                raw_df[f'{col}_{cat}'] = (col_lower == cat).astype(np.float32)
+            raw_df.drop(columns=[col], inplace=True)
+
+        # ── Step 3: Quantitative columns — min-max normalised ─────────────
+        quant_cols = [c for c in config.QUANTITATIVE_CLINICAL if c in raw_df.columns]
+        for col in quant_cols:
+            raw_df[col] = pd.to_numeric(raw_df[col], errors='coerce').fillna(0)
+        if self.scaler is not None and quant_cols:
+            raw_df[quant_cols] = self.scaler.transform(raw_df[quant_cols].values)
+
+        # ── Step 4: Assemble final column order and fill any remaining NaN ─
+        keep_cols = (
+            [c for c in BINARY_MAP if c in raw_df.columns]
+            + [f'{col}_{cat}'
+               for col, cats in config.CATEGORICAL_CLINICAL_ONEHOT.items()
+               for cat in cats
+               if f'{col}_{cat}' in raw_df.columns]
+            + [c for c in quant_cols if c in raw_df.columns]
         )
+        lookup_df = raw_df[keep_cols].fillna(0).astype(np.float32)
+
+        self.n_clinical      = lookup_df.shape[1]
+        self.clinical_cols   = keep_cols
         self.clinical_lookup = {
             str(pid): row.values
             for pid, row in lookup_df.iterrows()
         }
-        # Fill missing features with 0.0
-        if missing_cols:
-            for pid in self.clinical_lookup:
-                self.clinical_lookup[pid] = np.concatenate([
-                    self.clinical_lookup[pid],
-                    np.zeros(len(missing_cols), dtype=np.float32)
-                ])
-
-        self.n_clinical = len(self.feature_cols)
 
     def fit_scaler(self):
         """
-        Fit a MinMaxScaler on all clinical features.
+        Fit a MinMaxScaler on quantitative clinical features only.
 
         Per Appendix S1:
-          - Categorical features  → assumed already one-hot encoded in the CSV
-          - Quantitative features → min-max normalised to [0, 1]
+          - Categorical variables → one-hot encoded (already 0/1, no scaling)
+          - Quantitative variables → min-max normalised to [0, 1]
 
-        Since the CSV is expected to arrive pre-encoded (one-hot for categorical,
-        raw values for quantitative), the scaler is applied to the full feature
-        matrix. One-hot columns will naturally be bounded to [0, 1] already,
-        so applying MinMaxScaler to them is a no-op in practice.
-
-        Call this only on the TRAINING dataset, then pass the fitted scaler
-        to val/test datasets via apply_scaler().
+        Fits only on quantitative columns (age, ecog_status, tumor_volume)
+        from the training patients, then applies normalisation in-place to
+        the training clinical_lookup so __getitem__ always returns scaled values.
 
         Returns
         -------
-        scaler : MinMaxScaler
+        scaler : MinMaxScaler or None
         """
+        quant_cols = getattr(self, 'clinical_cols', [])
+        quant_idx  = [i for i, c in enumerate(quant_cols)
+                      if c in config.QUANTITATIVE_CLINICAL]
+
+        if not quant_idx:
+            print("No quantitative clinical columns — skipping scaler.")
+            return None
+
         all_clinical = np.vstack([
             self.clinical_lookup[pid]
             for pid in self.patient_ids
             if pid in self.clinical_lookup
-        ])
-        self.scaler = MinMaxScaler(feature_range=(0, 1))
-        self.scaler.fit(all_clinical)
-        print(f"Clinical MinMaxScaler fitted on {len(all_clinical)} patients "
-              f"— quantitative features normalised to [0, 1] (Appendix S1)")
-        return self.scaler
+        ])                                      # (N_train, N_features)
 
-    def apply_scaler(self, scaler):
-        """Apply an external scaler (fitted on training set)."""
-        self.scaler = scaler
+        quant_data = all_clinical[:, quant_idx] # (N_train, N_quant)
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaler.fit(quant_data)
+        self.scaler    = scaler
+        self.quant_idx = quant_idx
+
+        # Apply normalisation in-place to training lookup
+        for pid in list(self.clinical_lookup.keys()):
+            vec = self.clinical_lookup[pid].copy()
+            vec[quant_idx] = scaler.transform(vec[np.newaxis, quant_idx])[0]
+            self.clinical_lookup[pid] = vec
+
+        n_train = len([p for p in self.patient_ids if p in self.clinical_lookup])
+        print(f"Clinical MinMaxScaler fitted on {n_train} patients — "
+              f"{len(quant_idx)} quantitative features normalised to [0, 1]")
+        return scaler
+
+    def apply_scaler(self, scaler, quant_idx=None):
+        """
+        Apply a scaler fitted on the training set to this dataset.
+        Only quantitative columns (identified by quant_idx) are scaled.
+        """
+        self.scaler    = scaler
+        self.quant_idx = quant_idx or []
+        if scaler is not None and self.quant_idx:
+            for pid in list(self.clinical_lookup.keys()):
+                vec = self.clinical_lookup[pid].copy()
+                vec[self.quant_idx] = scaler.transform(
+                    vec[np.newaxis, self.quant_idx]
+                )[0]
+                self.clinical_lookup[pid] = vec
 
     def __getitem__(self, idx):
         graph = self.graphs[idx].clone()
         pid   = getattr(graph, 'patient_id', str(idx))
 
         # Attach clinical features
+        # Scaling is applied in-place during fit_scaler()/apply_scaler() so
+        # clinical_lookup already contains normalised values — just retrieve.
         if pid in self.clinical_lookup:
             clinical = self.clinical_lookup[pid].copy()
-            if self.scaler is not None:
-                clinical = self.scaler.transform(clinical[np.newaxis, :])[0]
-            graph.clinical = torch.tensor(clinical, dtype=torch.float)
+            graph.clinical = torch.tensor(clinical, dtype=torch.float).unsqueeze(0)
         else:
-            # Fallback: zeros
-            graph.clinical = torch.zeros(self.n_clinical, dtype=torch.float)
+            graph.clinical = torch.zeros(1, self.n_clinical, dtype=torch.float)
 
         return graph
 

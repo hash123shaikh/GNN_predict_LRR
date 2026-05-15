@@ -18,14 +18,11 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 MODEL_DIR = BASE_DIR / "models"
 LOGS_DIR = BASE_DIR / "logs"
 
-
-# With this single line pointing to the Images folder:
-IMAGES_DIR = Path("/home/radiomicsserver/Downloads/GNN_PREDICT_LRR/1_Idea/radgraph-hnscc/data/MAASTRO/Images") # Folder containing patient CT & RTSTRUCT folders
-
-CT_SCANS_DIR = IMAGES_DIR   # data_loader.py will look for CT/ subfolder inside each patient
-RTSTRUCT_DIR = IMAGES_DIR   # data_loader.py will look for RTSTRUCT/ subfolder inside each patient
-CLINICAL_DATA_FILE      = Path("data/MAASTRO/clinical_features.csv") # Folder containing clinical data
-RADIOMICS_FEATURES_FILE = Path("data/MAASTRO/radiomics_features.csv") # Your extracted features
+# Input data paths - MODIFY THESE
+CT_SCANS_DIR = DATA_DIR / "ct_scans"  # Folder containing patient CT folders
+RTSTRUCT_DIR = DATA_DIR / "rt_structs"  # Folder containing RT structure files
+CLINICAL_DATA_FILE = DATA_DIR / "MAASTRO" / "clinical_data.csv"  # CSV with clinical features
+RADIOMICS_FEATURES_FILE = OUTPUT_DIR / "gtv_features_extracted.csv"  # Saved by Stage 2 (feature extraction)
 
 # Create directories if they don't exist
 for directory in [OUTPUT_DIR, MODEL_DIR, LOGS_DIR]:
@@ -51,8 +48,8 @@ CLINICAL_FEATURES = [
 ]
 
 # Outcome variables (column names in your CSV)
-OUTCOME_LR = 'locoregional_recurrence'  # 0=No, 1=Yes
-OUTCOME_DM = 'distant_metastasis'  # 0=No, 1=Yes
+OUTCOME_LR    = 'locoregional_recurrence'   # 0=No, 1=Yes
+OUTCOME_DM    = 'distant_metastasis'         # 0=No, 1=Yes
 FOLLOWUP_TIME = 'locoregional_recurrence_in_days'  # days — auto-converted to months in data_loader
 
 # Minimum follow-up required (in months)
@@ -73,7 +70,7 @@ INTERPOLATION = 'linear'  # 'linear' or 'nearest'
 PERITUMORAL_MARGIN_MM = 50  # 5cm as in the paper
 
 # GTV contour name patterns (will try these in order)
-GTV_NAMES = ['GTV', 'GTV_Primary', 'GTVp', 'GTV_T', 'CTV', 'GTV-1', 'GTV-2']
+GTV_NAMES = ['GTV', 'GTV_Primary', 'GTVp', 'GTV_T', 'CTV', 'GTV1']
 
 # ============================================================================
 # SUPERVOXEL GENERATION (SLIC)
@@ -116,8 +113,12 @@ FEATURE_CLASSES = [
     'ngtdm'
 ]
 
-# Total expected features per region
-N_FEATURES_TOTAL = 93
+# Total features per node in the graph (Table S3 selected features)
+# LR task: 4 features   DM task: 6 features
+# This must match the number of features stored in each graph node.
+# Do NOT set this to 93 (full PyRadiomics set) — graph_builder.py
+# filters to Table S3 features before building the graph.
+N_FEATURES_TOTAL = 4   # LR task (change to 6 if running DM task)
 
 # ============================================================================
 # FEATURE SELECTION
@@ -258,7 +259,22 @@ GAT_FINAL_HEADS   = 1                      # Average in final layer
 GAT_OUTPUT_DIM = GAT_HIDDEN_DIM * GAT_N_HEADS if GAT_CONCAT_HEADS else GAT_HIDDEN_DIM
 
 # Clinical feature integration
-N_CLINICAL_FEATURES = len(CLINICAL_FEATURES)
+# Clinical features: split into categorical and quantitative
+# Categorical → one-hot encoded (paper: "categorical variables were one-hot encoded")
+CATEGORICAL_CLINICAL_BINARY = [
+    'sex',              # male/female          → 1 col (0/1)
+    'hpv_status',       # positive/negative    → 1 col (0/1)
+    'concurrent_chemo', # yes/no               → 1 col (0/1)
+]
+CATEGORICAL_CLINICAL_ONEHOT = {
+    'ajcc_stage':     ['i', 'ii', 'iii', 'iva', 'ivb', 'ivc'],  # 6 cols
+    'tumor_subsite':  ['larynx', 'oropharynx'],                   # 2 cols
+}
+# Quantitative → min-max normalised to [0, 1]
+QUANTITATIVE_CLINICAL = ['age', 'ecog_status', 'tumor_volume']
+
+# Total after encoding: 3 binary + 6 ajcc_stage + 2 tumor_subsite + 3 quantitative = 14
+N_CLINICAL_FEATURES = 14
 COMBINE_METHOD      = 'concatenate'
 
 # Final classification layer
@@ -284,14 +300,14 @@ RANDOM_SEED = 42
 BATCH_SIZE            = 64      # Table S2: 64 for both LR and DM
 LEARNING_RATE         = 4e-4    # Table S2: 4e-4 (LR), 3e-4 (DM)
 WEIGHT_DECAY          = 7e-4    # Table S2: 7e-4 (LR), 8e-4 (DM)
-N_EPOCHS              = 100
-EARLY_STOPPING_PATIENCE = 15
+N_EPOCHS              = 1000
+EARLY_STOPPING_PATIENCE = None   # Set to None to disable early stopping
 
 # Optimizer — Table S2: Adam for both tasks
 OPTIMIZER         = 'Adam'
-SCHEDULER         = 'WarmupReduceLROnPlateau'  # warmup + ReduceLROnPlateau
-SCHEDULER_PATIENCE= 5
-SCHEDULER_FACTOR  = 0.5
+SCHEDULER         = 'WarmupReduceLROnPlateau'
+SCHEDULER_PATIENCE= 100   # Wait 100 epochs before reducing LR
+SCHEDULER_FACTOR  = 0.5   # Halve LR when patience exceeded
 LR_WARMUP_STEPS   = 10    # Table S2: 10 (LR), 5 (DM)
 
 # Class imbalance — Table S2 sampling strategies

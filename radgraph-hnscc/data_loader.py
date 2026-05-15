@@ -394,16 +394,21 @@ class HNSCCDataLoader:
     
     def filter_patients_by_followup(self, min_followup_months=24):
         """
-        Filter patients with adequate follow-up.
+        Filter patients with adequate follow-up for the 2-year endpoint.
 
-        Handles both months and days columns automatically:
-          - If FOLLOWUP_TIME column contains 'day', values are treated as days
-            and converted to months (divided by 30.44) before filtering.
-          - Otherwise values are treated as months directly.
+        Clinical logic (standard survival analysis approach):
+          KEEP  if outcome == 1 (event occurred — include regardless of timing)
+          KEEP  if outcome == 0 AND follow-up >= 24 months (confirmed no event)
+          DROP  if outcome == 0 AND follow-up <  24 months (censored too early)
+
+        This corrects a common mistake where time-to-event columns are used
+        as follow-up duration for event-positive patients.  For patients who
+        had the event, the time column stores time-to-event (often < 730 days)
+        not total follow-up duration.
 
         Parameters
         ----------
-        min_followup_months : int
+        min_followup_months : int  default 24
 
         Returns
         -------
@@ -412,25 +417,46 @@ class HNSCCDataLoader:
         all_patients = self.get_patient_list()
         n_total      = len(all_patients)
 
-        if config.FOLLOWUP_TIME not in self.clinical_data.columns:
-            print(f"Warning: '{config.FOLLOWUP_TIME}' column not found. "
+        outcome_col  = config.OUTCOME_LR
+        followup_col = config.FOLLOWUP_TIME
+
+        # If either column is missing fall back to returning everyone
+        if followup_col not in self.clinical_data.columns:
+            print(f"Warning: '{followup_col}' column not found. "
                   f"Returning all {n_total} patients.")
             return all_patients
 
-        followup_values = self.clinical_data[config.FOLLOWUP_TIME].fillna(0)
+        if outcome_col not in self.clinical_data.columns:
+            print(f"Warning: '{outcome_col}' column not found. "
+                  f"Applying follow-up filter only.")
+            followup_values = self.clinical_data[followup_col].fillna(0)
+            if 'day' in followup_col.lower():
+                followup_values = followup_values / 30.44
+            mask = followup_values >= min_followup_months
+            return self.clinical_data.loc[mask, config.PATIENT_ID_COL].tolist()
 
-        # Convert days to months if column name suggests days
-        if 'day' in config.FOLLOWUP_TIME.lower():
+        followup_values = self.clinical_data[followup_col].fillna(0)
+        if 'day' in followup_col.lower():
             followup_values = followup_values / 30.44
-            print(f"  Converting '{config.FOLLOWUP_TIME}' from days to months (/30.44)")
+            print(f"  Converting '{followup_col}' from days to months (/30.44)")
 
-        mask = followup_values >= min_followup_months
+        outcome_values  = self.clinical_data[outcome_col].fillna(0).astype(int)
+
+        # Keep patients who had the event OR were followed long enough
+        mask = (outcome_values == 1) | (followup_values >= min_followup_months)
+
         valid_ids = self.clinical_data.loc[
             mask, config.PATIENT_ID_COL
         ].tolist()
 
-        print(f"Patients with >={min_followup_months} months follow-up: "
-              f"{len(valid_ids)}/{n_total}")
+        n_events    = int((outcome_values[mask] == 1).sum())
+        n_censored  = int((outcome_values[mask] == 0).sum())
+        n_excluded  = n_total - len(valid_ids)
+
+        print(f"Patients with ≥{min_followup_months}mo follow-up or event: "
+              f"{len(valid_ids)}/{n_total}  "
+              f"({n_events} positive, {n_censored} negative, "
+              f"{n_excluded} excluded — censored too early)")
 
         return valid_ids
 

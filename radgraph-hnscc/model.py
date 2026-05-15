@@ -231,39 +231,46 @@ class RadGraphGAT(nn.Module):
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, batch):
-        """
-        Parameters
-        ----------
-        batch : torch_geometric.data.Batch
-
-        Returns
-        -------
-        logits : Tensor (B,)
-        """
         x          = batch.x
         edge_index = batch.edge_index
         edge_attr  = batch.edge_attr if hasattr(batch, 'edge_attr') else None
         batch_vec  = batch.batch
 
+        def _nan_check(tensor, name):
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                print(f"  [NaN/Inf detected at: {name}]  "
+                      f"shape={tensor.shape}  "
+                      f"min={tensor[~torch.isnan(tensor)].min().item() if not torch.all(torch.isnan(tensor)) else 'all-nan'}  "
+                      f"max={tensor[~torch.isnan(tensor)].max().item() if not torch.all(torch.isnan(tensor)) else 'all-nan'}")
+
         # 1. Input projection
         x = self.input_proj(x)
+        _nan_check(x, "after input_proj")
 
-        # 2. GAT layers — batch_vec passed so LayerNorm normalises per-graph
-        for gat_layer in self.gat_layers:
+        # 2. GAT layers
+        for i, gat_layer in enumerate(self.gat_layers):
             x = gat_layer(x, edge_index, batch_vec, edge_attr)
+            _nan_check(x, f"after GAT layer {i+1}")
 
-        # 3. GTV node read-out (index 0 of each graph)
-        gtv_features = self._extract_gtv_nodes(x, batch_vec)   # (B, hidden_dim)
+        # 3. GTV node read-out
+        gtv_features = self._extract_gtv_nodes(x, batch_vec)
+        _nan_check(gtv_features, "after GTV readout")
 
         # 4. Clinical feature fusion
         if self.clinical_proj is not None and hasattr(batch, 'clinical'):
-            clinical_emb = self.clinical_proj(batch.clinical)   # (B, 16)
-            combined     = torch.cat([gtv_features, clinical_emb], dim=1)
+            clin = batch.clinical
+            if clin.dim() == 3:
+                clin = clin.squeeze(1)
+            _nan_check(clin, "clinical input")
+            clinical_emb = self.clinical_proj(clin)
+            _nan_check(clinical_emb, "after clinical_proj")
+            combined = torch.cat([gtv_features, clinical_emb], dim=1)
         else:
             combined = gtv_features
 
         # 5. Classification
-        logits = self.classifier(combined).squeeze(-1)          # (B,)
+        logits = self.classifier(combined).squeeze(-1)
+        _nan_check(logits, "logits output")
         return logits
 
     def predict_proba(self, batch):

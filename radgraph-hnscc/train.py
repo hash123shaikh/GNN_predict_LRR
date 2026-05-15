@@ -122,7 +122,7 @@ def train_model(
     train_loader,
     val_loader,
     optimizer,
-    scheduler,
+    scheduler,          # accepts single scheduler OR (warmup_sch, plateau_sch) tuple
     criterion,
     device,
     n_epochs      = None,
@@ -155,8 +155,11 @@ def train_model(
         Keys: 'train_loss', 'val_loss', 'val_auc', 'best_epoch', 'best_val_auc'
     best_model_path : Path
     """
-    n_epochs = n_epochs or config.N_EPOCHS
-    patience = patience or config.EARLY_STOPPING_PATIENCE
+    n_epochs = config.N_EPOCHS                if n_epochs is None else n_epochs
+    patience = config.EARLY_STOPPING_PATIENCE if patience is None else patience
+
+    # patience=None means early stopping is disabled — run all epochs
+    early_stopping_enabled = patience is not None
 
     best_model_path = config.MODEL_DIR / f'{model_name}_{task}.pth'
     history = {
@@ -167,12 +170,16 @@ def train_model(
         'best_val_auc': 0.0,
     }
 
-    early_stopper = EarlyStopping(patience=patience, mode='max')
+    early_stopper = EarlyStopping(
+        patience = patience if early_stopping_enabled else 10**9,
+        mode     = 'max'
+    )
     best_val_auc  = 0.0
     start_time    = time.time()
 
+    es_status = f"patience={patience}" if early_stopping_enabled else "disabled"
     print(f"\n{'='*60}")
-    print(f"Training RadGraphGAT | Task: {task} | Epochs: {n_epochs}")
+    print(f"Training RadGraphGAT | Task: {task} | Epochs: {n_epochs} | Early stopping: {es_status}")
     print(f"{'='*60}")
 
     for epoch in range(1, n_epochs + 1):
@@ -188,13 +195,20 @@ def train_model(
         history['val_loss'].append(val_loss)
         history['val_auc'].append(val_auc)
 
-        # LR scheduling — warmup for first N steps, then ReduceLROnPlateau
+        # LR scheduling — unpack tuple if both schedulers passed together
+        if isinstance(scheduler, tuple):
+            warmup_sch, plateau_sch = scheduler
+        else:
+            warmup_sch, plateau_sch = scheduler, None
+
+        warmup_steps = getattr(config, 'LR_WARMUP_STEPS', 10)
+
         _apply_schedulers(
-            warmup_scheduler  = scheduler,
-            plateau_scheduler = getattr(config, '_plateau_sch', None),
+            warmup_scheduler  = warmup_sch,
+            plateau_scheduler = plateau_sch,
             val_auc           = val_auc,
             current_epoch     = epoch,
-            warmup_steps      = getattr(config, '_warmup_steps', 0)
+            warmup_steps      = warmup_steps
         )
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -209,17 +223,17 @@ def train_model(
                   f"LR: {current_lr:.6f} | "
                   f"Time: {elapsed:.0f}s")
 
-        # Save best model
+        # Save best model checkpoint regardless of early stopping
         improved = early_stopper(val_auc)
-        if improved and val_auc > best_val_auc:
+        if val_auc > best_val_auc:
             best_val_auc = val_auc
-            history['best_epoch']   = epoch
-            history['best_val_auc'] = best_val_auc
+            history['best_epoch']    = epoch
+            history['best_val_auc']  = best_val_auc
             if save_best:
                 save_checkpoint(model, optimizer, epoch, best_val_auc, best_model_path)
 
-        # Early stopping
-        if early_stopper.early_stop:
+        # Early stopping — only if enabled
+        if early_stopping_enabled and early_stopper.early_stop:
             print(f"\n  Early stopping at epoch {epoch} "
                   f"(best val AUC: {best_val_auc:.4f} at epoch {history['best_epoch']})")
             break
@@ -269,7 +283,6 @@ def train_kfold(graphs, clinical_df, task='LR', n_splits=5, device=None):
         pos_weight = train_ds.get_class_weights()
         sampler, _ = _build_sampler(train_graphs, task=task)
 
-        from torch_geometric.loader import DataLoader as PyGDataLoader
         gat_cfg = config.get_gat_config(task)
 
         if sampler is not None:
@@ -297,7 +310,7 @@ def train_kfold(graphs, clinical_df, task='LR', n_splits=5, device=None):
         # Train
         history, _ = train_model(
             model, train_loader, val_loader,
-            optimizer, warmup_sch, criterion, device,
+            optimizer, (warmup_sch, plateau_sch), criterion, device,
             task        = task,
             model_name  = f'fold{fold_idx+1}',
         )
@@ -367,6 +380,7 @@ def _build_scheduler(optimizer, task='LR'):
         mode     = 'max',
         patience = config.SCHEDULER_PATIENCE,
         factor   = config.SCHEDULER_FACTOR,
+        min_lr   = 1e-5,   # floor — LR will never drop below this
         verbose  = False
     )
 
@@ -520,7 +534,6 @@ def main():
     gat_cfg = config.get_gat_config(args.task)
     sampler, _ = _build_sampler(train_graphs, task=args.task)
 
-    from torch_geometric.loader import DataLoader as PyGDataLoader
     if sampler is not None:
         train_loader = PyGDataLoader(
             train_ds,
@@ -572,7 +585,7 @@ def main():
     # Train
     history, best_model_path = train_model(
         model, train_loader, val_loader,
-        optimizer, warmup_sch, criterion, device,
+        optimizer, (warmup_sch, plateau_sch), criterion, device,
         task = args.task,
     )
 
