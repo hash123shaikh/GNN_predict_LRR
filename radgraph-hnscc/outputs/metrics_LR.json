@@ -1,0 +1,15 @@
+{
+  "auc": 0.4285714285714286,
+  "accuracy": 0.7368421052631579,
+  "sensitivity": 0.0,
+  "specificity": 1.0,
+  "precision": 0.0,
+  "f1": 0.0,
+  "tp": 0,
+  "tn": 14,
+  "fp": 0,
+  "fn": 5,
+  "auc_ci_low": 0.3214285714285714,
+  "auc_ci_high": 0.5,
+  "threshold": Infinity
+}
